@@ -1,0 +1,13 @@
+# 构建产物
+hx.exe
+*.test.exe
+
+# 本地缓存
+.cache/
+
+# 面试问答稿（不公开）
+hx-qa-*.md
+
+# 真实语料评测数据（含第三方内容，不随仓库分发；缺失时相关测试自跳过）
+kb/eval/testdata/realvault/
+kb/eval/testdata/realgold.json

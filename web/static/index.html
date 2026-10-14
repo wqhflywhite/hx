@@ -1,0 +1,327 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>hx</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #161a22;
+    --border: #262c38;
+    --fg: #d7dae0;
+    --dim: #7a8194;
+    --user: #6cc379;
+    --tool: #d8a657;
+    --error: #e06c75;
+    --accent: #4f8cff;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body {
+    display: flex;
+    background: var(--bg);
+    color: var(--fg);
+    font: 14px/1.6 ui-monospace, "Cascadia Mono", Consolas, monospace;
+  }
+  aside {
+    width: 240px;
+    flex: none;
+    background: var(--panel);
+    border-right: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+  }
+  .side-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--border);
+    color: var(--dim);
+  }
+  #sessions { list-style: none; overflow-y: auto; flex: 1; }
+  #sessions li {
+    padding: 6px 12px;
+    cursor: pointer;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  #sessions li:hover { background: #1c212b; }
+  #sessions li.active { color: var(--accent); }
+  main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  #transcript { flex: 1; overflow-y: auto; padding: 12px 16px; }
+  .line { white-space: pre-wrap; word-break: break-word; }
+  .line.user { color: var(--user); }
+  .line.user::before { content: "you: "; }
+  .line.tool { color: var(--tool); }
+  .line.tool::before { content: "[tool] "; }
+  .line.error { color: var(--error); }
+  #approvals { border-top: 1px solid var(--border); }
+  #approvals:empty { border-top: none; }
+  .approval {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 16px;
+    background: #241d12;
+    color: var(--tool);
+  }
+  .approval span { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  button {
+    background: var(--panel);
+    color: var(--fg);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 2px 12px;
+    font: inherit;
+    cursor: pointer;
+  }
+  button:hover { border-color: var(--accent); }
+  .approval button.allow { color: var(--user); }
+  .approval button.deny { color: var(--error); }
+  #composer { display: flex; border-top: 1px solid var(--border); }
+  #input {
+    flex: 1;
+    background: var(--bg);
+    color: var(--fg);
+    border: none;
+    outline: none;
+    padding: 10px 16px;
+    font: inherit;
+  }
+  #notices {
+    position: fixed;
+    right: 12px;
+    bottom: 48px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .notice {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 6px 12px;
+    color: var(--dim);
+  }
+</style>
+</head>
+<body>
+<aside>
+  <div class="side-head">会话 <button id="new-session">+ 新建</button></div>
+  <ul id="sessions"></ul>
+</aside>
+<main>
+  <div id="transcript"></div>
+  <div id="approvals"></div>
+  <form id="composer"><input id="input" autocomplete="off" placeholder="输入消息，Enter 发送"></form>
+</main>
+<div id="notices"></div>
+<script>
+"use strict";
+// The transcript model mirrors tui/render.go: assistant chunks append to the
+// open assistant line, and a tool/call folds with its tool/result by call id.
+const transcript = document.getElementById("transcript");
+const approvalsBox = document.getElementById("approvals");
+let es = null;
+let current = null;
+let streaming = false;
+let lastAssistant = null;
+const openTool = {};   // call id -> line element awaiting its result
+const approvals = {};  // approval id -> {name, arguments}; doubles as dedupe set
+
+// summary truncates s to its first 120 code points on one line.
+function summary(s) {
+  s = (s || "").trim().replace(/\n/g, " ");
+  const r = Array.from(s);
+  return r.length > 120 ? r.slice(0, 120).join("") + "…" : s;
+}
+
+function scrollDown() { transcript.scrollTop = transcript.scrollHeight; }
+
+function addLine(cls, text) {
+  const div = document.createElement("div");
+  div.className = "line " + cls;
+  div.textContent = text;
+  transcript.appendChild(div);
+  scrollDown();
+  return div;
+}
+
+function closeStream() { streaming = false; lastAssistant = null; }
+
+function resetView() {
+  transcript.innerHTML = "";
+  closeStream();
+  for (const id in openTool) delete openTool[id];
+  for (const id in approvals) delete approvals[id];
+  renderApprovals();
+}
+
+// applyEvent folds one session event into the view; ev.data is already an
+// object (the event payload embeds as raw JSON in the envelope).
+function applyEvent(ev) {
+  switch (ev.type) {
+    case "user/message":
+      closeStream();
+      addLine("user", ev.data.content);
+      break;
+    case "assistant/chunk":
+      if (streaming && lastAssistant) {
+        lastAssistant.textContent += ev.data.delta;
+        scrollDown();
+      } else {
+        streaming = true;
+        lastAssistant = addLine("assistant", ev.data.delta);
+      }
+      break;
+    case "assistant/message":
+      // Chunks already displayed the content.
+      closeStream();
+      break;
+    case "tool/call":
+      closeStream();
+      openTool[ev.data.id] = addLine("tool", ev.data.name + " " + summary(ev.data.arguments));
+      break;
+    case "tool/result": {
+      const text = ev.data.error ? "error: " + summary(ev.data.error) : summary(ev.data.content);
+      const line = ev.data.name + " → " + text;
+      const el = openTool[ev.data.call_id];
+      if (el) {
+        delete openTool[ev.data.call_id];
+        el.textContent = line;
+        scrollDown();
+      } else {
+        addLine("tool", line);
+      }
+      break;
+    }
+    case "turn/end":
+      closeStream();
+      if (ev.data.error) addLine("error", "turn failed: " + ev.data.error);
+      break;
+    default:
+      // turn/start and step boundaries carry no visible content.
+  }
+}
+
+function renderApprovals() {
+  approvalsBox.innerHTML = "";
+  for (const id in approvals) {
+    const a = approvals[id];
+    const bar = document.createElement("div");
+    bar.className = "approval";
+    const label = document.createElement("span");
+    label.textContent = "批准运行 " + a.name + " " + summary(a.arguments) + " ?";
+    const allow = document.createElement("button");
+    allow.className = "allow";
+    allow.textContent = "批准";
+    allow.onclick = () => answer(id, true);
+    const deny = document.createElement("button");
+    deny.className = "deny";
+    deny.textContent = "拒绝";
+    deny.onclick = () => answer(id, false);
+    bar.append(label, allow, deny);
+    approvalsBox.appendChild(bar);
+  }
+}
+
+async function answer(id, allow) {
+  delete approvals[id];
+  renderApprovals();
+  await post("/api/approval", { id, allow });
+}
+
+function notice(text) {
+  const n = document.createElement("div");
+  n.className = "notice";
+  n.textContent = text;
+  document.getElementById("notices").appendChild(n);
+  setTimeout(() => n.remove(), 5000);
+}
+
+async function post(url, body) {
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) notice(url + ": " + res.status + " " + (await res.text()).trim());
+  } catch (err) {
+    notice(url + ": " + err);
+  }
+}
+
+async function refreshSessions() {
+  try {
+    const res = await fetch("/api/sessions");
+    if (!res.ok) return;
+    const body = await res.json();
+    current = body.current;
+    const ul = document.getElementById("sessions");
+    ul.innerHTML = "";
+    for (const id of body.sessions || []) {
+      const li = document.createElement("li");
+      li.textContent = id;
+      if (id === current) li.className = "active";
+      li.onclick = () => { if (id !== current) post("/api/session/resume", { id }); };
+      ul.appendChild(li);
+    }
+  } catch (err) {
+    notice("加载会话列表失败: " + err);
+  }
+}
+
+function handle(env) {
+  switch (env.kind) {
+    case "session":
+      applyEvent(env.event);
+      break;
+    case "approval":
+      // Deduplicate: a late-join backfill may repeat a live envelope.
+      if (!approvals[env.id]) {
+        approvals[env.id] = { name: env.name, arguments: env.arguments };
+        renderApprovals();
+      }
+      break;
+    case "notice":
+      notice(env.text);
+      break;
+    case "session-changed":
+      current = env.id;
+      refreshSessions();
+      connect(env.id);
+      break;
+  }
+}
+
+function connect(id) {
+  if (es) es.close();
+  resetView();
+  es = new EventSource("/api/events?session=" + encodeURIComponent(id));
+  // Replays (auto-reconnect included) start with a full backfill, so every
+  // fresh connection rebuilds the view from scratch.
+  es.onopen = resetView;
+  es.onmessage = (m) => handle(JSON.parse(m.data));
+}
+
+document.getElementById("composer").onsubmit = (e) => {
+  e.preventDefault();
+  const input = document.getElementById("input");
+  if (!input.value.trim()) return;
+  const text = input.value;
+  input.value = "";
+  post("/api/send", { text });
+};
+document.getElementById("new-session").onclick = () => post("/api/session/new", {});
+
+(async () => {
+  await refreshSessions();
+  if (current) connect(current);
+})();
+</script>
+</body>
+</html>
