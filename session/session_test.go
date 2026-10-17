@@ -1,6 +1,7 @@
 package session_test
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -296,14 +297,14 @@ func TestReadEventsTruncatesAtCorruptLine(t *testing.T) {
 func TestDeriveMessagesWithPrune(t *testing.T) {
 	call := llm.ToolCall{ID: "c1", Name: "bash", Arguments: `{"command":"ls"}`}
 	events := []session.Event{
-		{Type: session.UserMessage, Data: session.MarshalData(session.UserMessageData{Content: "hi"})},                             // 0
-		{Type: session.AssistantMessage, Data: session.MarshalData(session.AssistantMessageData{ToolCalls: []llm.ToolCall{call}})}, // 1
+		{Type: session.UserMessage, Data: session.MarshalData(session.UserMessageData{Content: "hi"})},                                   // 0
+		{Type: session.AssistantMessage, Data: session.MarshalData(session.AssistantMessageData{ToolCalls: []llm.ToolCall{call}})},       // 1
 		{Type: session.ToolResult, Data: session.MarshalData(session.ToolResultData{CallID: "c1", Name: "bash", Content: "x-original"})}, // 2
-		{Type: session.Prune, Data: session.MarshalData(session.PruneData{Seq: 2, Content: "x-pruned"})},                          // 3
-		{Type: session.Summary, Data: session.MarshalData(session.SummaryData{Content: "S"})},                                     // 4
+		{Type: session.Prune, Data: session.MarshalData(session.PruneData{Seq: 2, Content: "x-pruned"})},                                 // 3
+		{Type: session.Summary, Data: session.MarshalData(session.SummaryData{Content: "S"})},                                            // 4
 		{Type: session.ToolResult, Data: session.MarshalData(session.ToolResultData{CallID: "c2", Name: "bash", Content: "y-original"})}, // 5
-		{Type: session.Prune, Data: session.MarshalData(session.PruneData{Seq: 5, Content: "y-pruned"})},                          // 6
-		{Type: session.Prune, Data: session.MarshalData(session.PruneData{Seq: 2, Content: "dead"})},                              // 7 指向水位线之前，落空
+		{Type: session.Prune, Data: session.MarshalData(session.PruneData{Seq: 5, Content: "y-pruned"})},                                 // 6
+		{Type: session.Prune, Data: session.MarshalData(session.PruneData{Seq: 2, Content: "dead"})},                                     // 7 指向水位线之前，落空
 	}
 	assertMsgs := func(evs []session.Event, want []llm.Message) {
 		t.Helper()
@@ -365,4 +366,70 @@ func mustEvents(t *testing.T, mgr *session.Manager, id string) []session.Event {
 		t.Fatal(err)
 	}
 	return events
+}
+
+// TestResumeRepairsCorruptTail 覆盖坏行后的恢复与追加：Resume 必须
+// 先把日志的坏后缀物理截断，之后 Append 的事件才能在换 Manager
+// 冷读时恢复；不允许「Append 报成功、冷读却丢失」。末尾无换行的
+// 好行也必须妥善处理，追加不得与其粘连。
+func TestResumeRepairsCorruptTail(t *testing.T) {
+	good := func(content string) []byte {
+		raw, err := json.Marshal(session.Event{Type: session.UserMessage, Data: session.MarshalData(session.UserMessageData{Content: content})})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return append(raw, '\n')
+	}
+	cases := []struct {
+		name string
+		file []byte   // 崩溃残留的文件内容
+		want []string // 修复并追加 e3、e4 后冷读应得到的内容
+	}{
+		{"末尾半行", append(append(good("e1"), good("e2")...), []byte(`{"type":"user/mess`)...), []string{"e1", "e2", "e3", "e4"}},
+		{"中间坏行", append(append(good("e1"), []byte("{not json\n")...), good("e2")...), []string{"e1", "e3", "e4"}},
+		{"末尾好行无换行", append(good("e1"), bytes.TrimSuffix(good("e2"), []byte("\n"))...), []string{"e1", "e2", "e3", "e4"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(dir, "s.jsonl"), tc.file, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			root := fiber.New()
+			defer root.Dispose()
+			mgr1, err := session.NewManager(dir, fixedClock(), idGen())
+			if err != nil {
+				t.Fatal(err)
+			}
+			store, err := mgr1.Resume("s")
+			if err != nil {
+				t.Fatalf("resume: %v", err)
+			}
+			appendEvents(t, store, root.Context(), []session.Event{
+				{Type: session.UserMessage, Data: session.MarshalData(session.UserMessageData{Content: "e3"})},
+				{Type: session.UserMessage, Data: session.MarshalData(session.UserMessageData{Content: "e4"})},
+			})
+			if closer, ok := store.(interface{ Close() error }); ok {
+				closer.Close()
+			}
+			// 换 Manager 冷读：绕过投影缓存，直接面对磁盘事实。
+			mgr2, err := session.NewManager(dir, fixedClock(), idGen())
+			if err != nil {
+				t.Fatal(err)
+			}
+			events, err := mgr2.Events("s")
+			if err != nil {
+				t.Fatalf("cold read after repair: %v", err)
+			}
+			if len(events) != len(tc.want) {
+				t.Fatalf("cold read = %d events; want %d: %v", len(events), len(tc.want), tc.want)
+			}
+			for i, w := range tc.want {
+				var d session.UserMessageData
+				if err := json.Unmarshal(events[i].Data, &d); err != nil || d.Content != w {
+					t.Fatalf("events[%d] content = %q err=%v; want %q", i, d.Content, err, w)
+				}
+			}
+		})
+	}
 }

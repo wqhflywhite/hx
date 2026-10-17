@@ -3,8 +3,10 @@ package session
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -180,13 +182,78 @@ func (m *Manager) Create() (Store, string, error) {
 	return store, id, nil
 }
 
-// Resume 实现 Opener。
+// Resume 实现 Opener。打开后先经 repairTail 修复崩溃残留的坏
+// 后缀，再把文件指针定位到写入位置。句柄不带 O_APPEND（Windows
+// 上 O_APPEND 句柄无法 Truncate），因此写入位置完全依赖文件指针：
+// 单句柄由 FileLog.mu 串行化；多句柄、多进程的顺序协议在 P1-5
+// 收口之前，会话目录假设单写者独占。
 func (m *Manager) Resume(id string) (Store, error) {
-	f, err := os.OpenFile(m.path(id), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	f, err := os.OpenFile(m.path(id), os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("session: resume %q: %w", id, err)
+	}
+	off, err := repairTail(f)
+	if err != nil {
+		f.Close()
+		return nil, fmt.Errorf("session: resume %q: %w", id, err)
+	}
+	if _, err := f.Seek(off, io.SeekStart); err != nil {
+		f.Close()
+		return nil, fmt.Errorf("session: resume %q: %w", id, err)
 	}
 	return &FileLog{m: m, id: id, f: f}, nil
+}
+
+// repairTail 扫描日志并返回 Append 应使用的写入偏移。崩溃残留的
+// 坏后缀（第一个无法解析为 Event 的行及其之后的一切，与 readEvents
+// 的逻辑截断语义一致）被物理截断；末尾无换行的好行补写换行符，
+// 使后续 Append 永不与其粘连。空行不计入事件但计入偏移，与
+// readEvents 的跳过一致。修复落盘后立即 fsync。本函数在 Resume
+// 返回句柄之前运行，因此被截断的字节不可能已存在于任何投影缓存
+// 中。IO 错误 fail loud，绝不当坏数据处理——那会误删好数据。
+func repairTail(f *os.File) (int64, error) {
+	r := bufio.NewReader(f)
+	var off int64
+	var bad, dirty bool
+	for {
+		line, err := r.ReadBytes('\n')
+		if len(bytes.TrimRight(line, "\r\n")) > 0 {
+			var ev Event
+			if json.Unmarshal(line, &ev) != nil {
+				bad = true
+				break
+			}
+		}
+		off += int64(len(line))
+		if err == nil {
+			continue
+		}
+		if err != io.EOF {
+			return 0, fmt.Errorf("session: scan log: %w", err)
+		}
+		if len(line) > 0 {
+			// 末尾好行缺换行符：补写一个，否则 Append 会与其
+			// 粘连成一条新的坏行。
+			if _, werr := f.WriteAt([]byte{'\n'}, off); werr != nil {
+				return 0, fmt.Errorf("session: repair missing newline: %w", werr)
+			}
+			off++
+			dirty = true
+		}
+		break
+	}
+	if bad {
+		if err := f.Truncate(off); err != nil {
+			return 0, fmt.Errorf("session: truncate corrupt tail: %w", err)
+		}
+		dirty = true
+	}
+	if dirty {
+		if err := f.Sync(); err != nil {
+			return 0, fmt.Errorf("session: sync repaired log: %w", err)
+		}
+	}
+	return off, nil
 }
 
 // Events 读回一个会话的完整日志；若投影缓存已热，
