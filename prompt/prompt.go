@@ -55,10 +55,11 @@ func (p *Prompt) Register(s Section) fiber.Disposer {
 	}
 }
 
-// Assemble 按 Order 渲染各分区并拼接，将拼接文本送入
-// prompt/assemble 瀑布（waterfall）处理，并在挂载了 "tools"
-// 服务时从中收集工具 schema；schema 列表再过一道
-// prompt/tools 瀑布，检索式加载等插件在这里按需裁剪。
+// Assemble 按 (Order, Name) 的确定顺序渲染各分区并拼接：Register
+// 拒绝重名使该二元组构成全序，拼接结果与 map 遍历、注册顺序无关，
+// 跨进程逐字节一致。拼接文本送入 prompt/assemble 瀑布（waterfall）
+// 处理，并在挂载了 "tools" 服务时从中收集工具 schema；schema 列表
+// 再过一道 prompt/tools 瀑布，检索式加载等插件在这里按需裁剪。
 func (p *Prompt) Assemble(c *fiber.Context) (string, []llm.ToolSchema, error) {
 	p.mu.RLock()
 	sections := make([]Section, 0, len(p.sections))
@@ -66,7 +67,12 @@ func (p *Prompt) Assemble(c *fiber.Context) (string, []llm.ToolSchema, error) {
 		sections = append(sections, s)
 	}
 	p.mu.RUnlock()
-	sort.Slice(sections, func(i, j int) bool { return sections[i].Order < sections[j].Order })
+	sort.Slice(sections, func(i, j int) bool {
+		if sections[i].Order != sections[j].Order {
+			return sections[i].Order < sections[j].Order
+		}
+		return sections[i].Name < sections[j].Name
+	})
 
 	var parts []string
 	for _, s := range sections {
