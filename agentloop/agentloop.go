@@ -150,18 +150,29 @@ func (a *loopAgent) turn(text string) {
 			return
 		}
 		calls, stepErr := a.step(ctx)
-		if stepErr != nil {
-			turnErr = stepErr.Error()
-		} else {
-			for _, call := range calls {
+		if stepErr == nil {
+			for i, call := range calls {
 				if err := a.append(c, session.ToolCall, session.ToolCallData{ID: call.ID, Name: call.Name, Arguments: call.Arguments}); err != nil {
 					return
 				}
-				res := a.tools(c).Execute(c, call)
+				reg, err := a.tools(c)
+				if err != nil {
+					for _, rest := range calls[i:] {
+						if aerr := a.append(c, session.ToolResult, session.ToolResultData{CallID: rest.ID, Name: rest.Name, Error: err.Error()}); aerr != nil {
+							return
+						}
+					}
+					stepErr = err
+					break
+				}
+				res := reg.Execute(c, call)
 				if err := a.append(c, session.ToolResult, session.ToolResultData{CallID: call.ID, Name: call.Name, Content: res.Content, Error: res.Error}); err != nil {
 					return
 				}
 			}
+		}
+		if stepErr != nil {
+			turnErr = stepErr.Error()
 		}
 		if err := a.append(c, session.StepEnd, session.StepEndData{Session: a.id, Step: step}); err != nil {
 			return
@@ -173,10 +184,14 @@ func (a *loopAgent) turn(text string) {
 	_ = a.append(c, session.TurnEnd, session.TurnEndData{Session: a.id, Error: turnErr})
 }
 
-// tools 解析工具注册表；agentloop 的 inject 声明保证它存在。
-func (a *loopAgent) tools(c *fiber.Context) *tools.Registry {
-	reg, _ := fiber.Get[*tools.Registry](c, "tools")
-	return reg
+// tools 解析工具注册表；热重挂期间服务可能缺席（inject 只保证
+// 挂载时的依赖就绪），调用方必须处理 error，不得解引用零值。
+func (a *loopAgent) tools(c *fiber.Context) (*tools.Registry, error) {
+	reg, ok := fiber.Get[*tools.Registry](c, "tools")
+	if !ok {
+		return nil, fmt.Errorf("agentloop: tools service unavailable")
+	}
+	return reg, nil
 }
 
 // step 从日志组装请求，流式接收一次模型响应并记录每个

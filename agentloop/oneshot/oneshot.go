@@ -125,19 +125,32 @@ func (a *oneshotAgent) turn(text string) {
 		return
 	}
 	calls, stepErr := a.stream(ctx, true)
-	if stepErr != nil {
-		turnErr = stepErr.Error()
-	} else {
-		for _, call := range calls {
+	if stepErr == nil {
+		for i, call := range calls {
 			if err := a.append(c, session.ToolCall, session.ToolCallData{ID: call.ID, Name: call.Name, Arguments: call.Arguments}); err != nil {
 				return
 			}
-			reg, _ := fiber.Get[*tools.Registry](c, "tools")
+			reg, err := a.tools(c)
+			if err != nil {
+				// 服务缺席：assistant/message 已宣布全部调用，为当前及
+				// 剩余所有 call 补写失败的 tool/result 保持配对，
+				// 再把本 turn 转成错误收尾——下一轮请求才合法。
+				for _, rest := range calls[i:] {
+					if aerr := a.append(c, session.ToolResult, session.ToolResultData{CallID: rest.ID, Name: rest.Name, Error: err.Error()}); aerr != nil {
+						return
+					}
+				}
+				stepErr = err
+				break
+			}
 			res := reg.Execute(c, call)
 			if err := a.append(c, session.ToolResult, session.ToolResultData{CallID: call.ID, Name: call.Name, Content: res.Content, Error: res.Error}); err != nil {
 				return
 			}
 		}
+	}
+	if stepErr != nil {
+		turnErr = stepErr.Error()
 	}
 	if err := a.append(c, session.StepEnd, session.StepEndData{Session: a.id, Step: 0}); err != nil {
 		return
@@ -154,6 +167,16 @@ func (a *oneshotAgent) turn(text string) {
 		}
 	}
 	_ = a.append(c, session.TurnEnd, session.TurnEndData{Session: a.id, Error: turnErr})
+}
+
+// tools 解析工具注册表；热重挂期间服务可能缺席（inject 只保证
+// 挂载时的依赖就绪），调用方必须处理 error，不得解引用零值。
+func (a *oneshotAgent) tools(c *fiber.Context) (*tools.Registry, error) {
+	reg, ok := fiber.Get[*tools.Registry](c, "tools")
+	if !ok {
+		return nil, fmt.Errorf("oneshot: tools service unavailable")
+	}
+	return reg, nil
 }
 
 // stream 是一个 step 的请求半边：从日志装配上下文，发起流式

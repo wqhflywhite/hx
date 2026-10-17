@@ -15,6 +15,7 @@ import (
 	"hx/agent"
 	"hx/core/event"
 	"hx/core/fiber"
+	"hx/core/plugin"
 	"hx/hxconfig"
 	"hx/llm"
 	"hx/session"
@@ -219,5 +220,130 @@ plugins:
 	}
 	if len(bodies[1].Tools) != 0 {
 		t.Fatal("the wrap-up request must offer no tools")
+	}
+}
+
+// TestToolsUnavailableMidTurn 覆盖热重挂窗口：turn 执行工具调用时
+// tools 服务已被 revoke，driver 不得 panic；它必须为
+// assistant/message 已宣布的调用补写失败的 tool/result 保持配对，
+// 以错误收尾 turn，且不跑收尾 step——使下一轮请求合法。
+func TestToolsUnavailableMidTurn(t *testing.T) {
+	server := newFakeServer()
+	defer server.Close()
+	dir := t.TempDir()
+
+	root := fiber.New()
+	defer root.Dispose()
+	ctx := root.Context()
+
+	sessCfg := map[string]any{
+		"dir":   dir,
+		"clock": func() time.Time { return time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC) },
+		"idgen": func() string { return "sess-fixed" },
+	}
+	for _, step := range []struct {
+		name string
+		cfg  map[string]any
+	}{
+		{"session", sessCfg},
+		{"llm", nil},
+		{"deepseek", map[string]any{"base_url": server.URL, "api_key": "test-key", "model": "test-model"}},
+		{"prompt", nil},
+		{"agents", nil},
+	} {
+		if err := plugin.Mount(ctx, step.name, step.cfg); err != nil {
+			t.Fatalf("mount %s: %v", step.name, err)
+		}
+	}
+	// tools 由测试手动提供，以便在 turn 前撤销，模拟热重挂窗口。
+	revokeTools := fiber.Provide(ctx, "tools", tools.NewRegistry())
+	if err := plugin.Mount(ctx, "oneshotloop", nil); err != nil {
+		t.Fatalf("mount oneshotloop: %v", err)
+	}
+
+	agents, ok := fiber.Get[*agent.Registry](ctx, "agents")
+	if !ok {
+		t.Fatal("agents service unavailable")
+	}
+	ag, err := agents.Create(ctx, agent.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ag.Dispose()
+
+	turnDone := make(chan session.TurnEndData, 1)
+	event.On[session.Event](ctx, "session/event", func(_ *fiber.Context, ev session.Event) {
+		if ev.Type == session.TurnEnd {
+			var d session.TurnEndData
+			if json.Unmarshal(ev.Data, &d) == nil {
+				turnDone <- d
+			}
+		}
+	})
+
+	if err := revokeTools(); err != nil {
+		t.Fatal(err)
+	}
+	ag.Send("do it")
+	select {
+	case end := <-turnDone:
+		if end.Error == "" {
+			t.Fatal("turn must end with an error when the tools service is gone")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("turn did not finish")
+	}
+
+	// 日志形态：已宣布的调用有配对的失败 result，没有收尾 step，
+	// turn 带错误。
+	raw, err := os.ReadFile(filepath.Join(dir, "sess-fixed.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var types []string
+	var resultErr string
+	for _, ln := range strings.Split(strings.TrimRight(string(raw), "\n"), "\n") {
+		var ev session.Event
+		if err := json.Unmarshal([]byte(ln), &ev); err != nil {
+			t.Fatalf("bad log line: %v", err)
+		}
+		types = append(types, ev.Type)
+		if ev.Type == session.ToolResult {
+			var d session.ToolResultData
+			if err := json.Unmarshal(ev.Data, &d); err != nil {
+				t.Fatal(err)
+			}
+			resultErr = d.Error
+		}
+	}
+	want := []string{
+		session.UserMessage, session.TurnStart, session.StepStart,
+		session.AssistantChunk, session.AssistantMessage,
+		session.ToolCall, session.ToolResult,
+		session.StepEnd, session.TurnEnd,
+	}
+	if strings.Join(types, ",") != strings.Join(want, ",") {
+		t.Fatalf("event sequence = %v; want %v", types, want)
+	}
+	if resultErr == "" {
+		t.Fatal("tool/result must carry the failure, keeping the announced call paired")
+	}
+
+	// 投影配对合法：带 ToolCalls 的 assistant 消息紧跟同 ID 的 tool 消息。
+	mgr, err := session.NewManager(dir, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	events, err := mgr.Events("sess-fixed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	msgs := session.DeriveMessages(events)
+	for i, m := range msgs {
+		for _, tc := range m.ToolCalls {
+			if i+1 >= len(msgs) || msgs[i+1].Role != "tool" || msgs[i+1].ToolCallID != tc.ID {
+				t.Fatalf("dangling tool call %q in projection: %+v", tc.ID, msgs)
+			}
+		}
 	}
 }
