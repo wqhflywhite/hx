@@ -170,16 +170,68 @@ func NewManager(dir string, clock func() time.Time, idgen func() string) (*Manag
 	return &Manager{dir: dir, clock: clock, idgen: idgen, projs: make(map[string]*projection)}, nil
 }
 
-func (m *Manager) path(id string) string { return filepath.Join(m.dir, id+".jsonl") }
+// validateID 校验会话 id：拒绝任何可能让路径逃逸出会话目录的
+// 形态。id 最终可来自外部输入（web resume、命令行参数）。
+func validateID(id string) error {
+	if id == "" {
+		return fmt.Errorf("session: empty session id")
+	}
+	if id == "." || id == ".." {
+		return fmt.Errorf("session: invalid session id %q", id)
+	}
+	if strings.ContainsAny(id, `/\`) {
+		return fmt.Errorf("session: session id %q contains path separator", id)
+	}
+	if filepath.IsAbs(id) {
+		return fmt.Errorf("session: session id %q is an absolute path", id)
+	}
+	if filepath.VolumeName(id) != "" {
+		return fmt.Errorf("session: session id %q contains a volume name", id)
+	}
+	return nil
+}
+
+func (m *Manager) path(id string) (string, error) {
+	if err := validateID(id); err != nil {
+		return "", err
+	}
+	p := filepath.Join(m.dir, id+".jsonl")
+	rel, err := filepath.Rel(m.dir, p)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("session: session id %q escapes the sessions dir", id)
+	}
+	return p, nil
+}
 
 // Create 实现 Opener。
 func (m *Manager) Create() (Store, string, error) {
 	id := m.idgen()
-	store, err := m.Resume(id)
+	store, err := m.open(id, os.O_CREATE|os.O_EXCL)
 	if err != nil {
 		return nil, "", err
 	}
 	return store, id, nil
+}
+
+func (m *Manager) open(id string, flag int) (Store, error) {
+	path, err := m.path(id)
+	if err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile(path, flag|os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, fmt.Errorf("session: open %q: %w", id, err)
+	}
+	off, err := repairTail(f)
+	if err != nil {
+		f.Close()
+		return nil, fmt.Errorf("session: open %q: %w", id, err)
+	}
+	if _, err := f.Seek(off, io.SeekStart); err != nil {
+		f.Close()
+		return nil, fmt.Errorf("session: open %q: %w", id, err)
+	}
+	return &FileLog{m: m, id: id, f: f}, nil
 }
 
 // Resume 实现 Opener。打开后先经 repairTail 修复崩溃残留的坏
@@ -188,20 +240,7 @@ func (m *Manager) Create() (Store, string, error) {
 // 单句柄由 FileLog.mu 串行化；多句柄、多进程的顺序协议在 P1-5
 // 收口之前，会话目录假设单写者独占。
 func (m *Manager) Resume(id string) (Store, error) {
-	f, err := os.OpenFile(m.path(id), os.O_CREATE|os.O_RDWR, 0o644)
-	if err != nil {
-		return nil, fmt.Errorf("session: resume %q: %w", id, err)
-	}
-	off, err := repairTail(f)
-	if err != nil {
-		f.Close()
-		return nil, fmt.Errorf("session: resume %q: %w", id, err)
-	}
-	if _, err := f.Seek(off, io.SeekStart); err != nil {
-		f.Close()
-		return nil, fmt.Errorf("session: resume %q: %w", id, err)
-	}
-	return &FileLog{m: m, id: id, f: f}, nil
+	return m.open(id, 0)
 }
 
 // repairTail 扫描日志并返回 Append 应使用的写入偏移。崩溃残留的
@@ -266,7 +305,11 @@ func (m *Manager) Events(id string) ([]Event, error) {
 		return events, nil
 	}
 	m.mu.Unlock()
-	return readEvents(m.path(id))
+	path, err := m.path(id)
+	if err != nil {
+		return nil, err
+	}
+	return readEvents(path)
 }
 
 // List 返回目录中所有会话日志的 id，已排序。
@@ -297,7 +340,11 @@ func (m *Manager) Fork(src string, boundary int) (string, error) {
 		return "", fmt.Errorf("session: fork boundary %d out of range [0,%d]", boundary, len(events))
 	}
 	id := m.idgen()
-	f, err := os.OpenFile(m.path(id), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+	path, err := m.path(id)
+	if err != nil {
+		return "", err
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
 	if err != nil {
 		return "", err
 	}

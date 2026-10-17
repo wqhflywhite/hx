@@ -159,13 +159,17 @@ func (m *Manager) projection(id string) (*projection, error) {
 	if p, ok := m.projs[id]; ok {
 		return p, nil
 	}
-	events, err := readEvents(m.path(id))
+	p, err := m.path(id)
 	if err != nil {
 		return nil, err
 	}
-	p := &projection{events: events}
-	m.projs[id] = p
-	return p, nil
+	events, err := readEvents(p)
+	if err != nil {
+		return nil, err
+	}
+	pro := &projection{events: events}
+	m.projs[id] = pro
+	return pro, nil
 }
 
 // noteAppend 把已持久化的追加同步进投影缓存。日志行已在

@@ -3,6 +3,7 @@ package session_test
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -431,5 +432,113 @@ func TestResumeRepairsCorruptTail(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestRejectsPathEscapingID 覆盖会话 id 的路径逃逸防护：任何可能
+// 逃出会话目录的 id 在 Manager 边界 fail loud，且不在目录外创建
+// 文件。id 最终可来自外部输入（web resume、命令行参数）。
+func TestRejectsPathEscapingID(t *testing.T) {
+	bad := []string{
+		"", ".", "..", "../escape", "../../tmp/x", `..\escape`, "a/b", `a\b`,
+		"/abs/path", `C:\evil`, "C:foo", `\share\x`,
+	}
+	for _, id := range bad {
+		t.Run(fmt.Sprintf("%q", id), func(t *testing.T) {
+			dir := t.TempDir()
+			mgr, err := session.NewManager(dir, fixedClock(), idGen())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := mgr.Resume(id); err == nil {
+				t.Fatalf("Resume(%q) must fail", id)
+			}
+			if _, err := mgr.Events(id); err == nil {
+				t.Fatalf("Events(%q) must fail", id)
+			}
+			if _, err := mgr.Messages(id); err == nil {
+				t.Fatalf("Messages(%q) must fail", id)
+			}
+			if _, err := mgr.Fork(id, 0); err == nil {
+				t.Fatalf("Fork(%q) must fail", id)
+			}
+			// 逃逸目标（dir 的父级兄弟路径）不得被创建。
+			sibling := filepath.Join(dir, "..", "escape.jsonl")
+			if _, err := os.Stat(sibling); !os.IsNotExist(err) {
+				t.Fatalf("escape target %q must not exist", sibling)
+			}
+		})
+	}
+}
+
+// TestResumeRequiresExistingLog 钉住 Resume 的新语义：恢复一个
+// 不存在的会话必须报错，不得隐式创建空日志——打错的会话名以前
+// 会静默造出新文件，把「恢复错会话」变成「数据写进新文件」。
+func TestResumeRequiresExistingLog(t *testing.T) {
+	dir := t.TempDir()
+	mgr, err := session.NewManager(dir, fixedClock(), idGen())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mgr.Resume("ghost"); err == nil {
+		t.Fatal("Resume of a missing session must fail")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "ghost.jsonl")); !os.IsNotExist(err) {
+		t.Fatal("Resume must not create the log file")
+	}
+	// 已存在的会话照常恢复。
+	store, id, err := mgr.Create()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if closer, ok := store.(interface{ Close() error }); ok {
+		closer.Close()
+	}
+	resumed, err := mgr.Resume(id)
+	if err != nil {
+		t.Fatalf("Resume of an existing session: %v", err)
+	}
+	if closer, ok := resumed.(interface{ Close() error }); ok {
+		closer.Close()
+	}
+}
+
+// TestCreateRejectsIDCollision 覆盖 idgen 撞 id：Create 必须排他
+// 失败，而不是追加进已有会话的日志造成数据混淆。
+func TestCreateRejectsIDCollision(t *testing.T) {
+	dir := t.TempDir()
+	collide := func() string { return "fixed-id" }
+	mgr, err := session.NewManager(dir, fixedClock(), collide)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := fiber.New()
+	defer root.Dispose()
+	store, id, err := mgr.Create()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if closer, ok := store.(interface{ Close() error }); ok {
+			closer.Close()
+		}
+	}()
+	appendEvents(t, store, root.Context(), []session.Event{
+		{Type: session.UserMessage, Data: session.MarshalData(session.UserMessageData{Content: "original"})},
+	})
+	if _, _, err := mgr.Create(); err == nil {
+		t.Fatal("Create with a colliding id must fail")
+	}
+	// 旧日志不受影响：换 Manager 冷读仍只有原有的一条事件。
+	mgr2, err := session.NewManager(dir, fixedClock(), idGen())
+	if err != nil {
+		t.Fatal(err)
+	}
+	events, err := mgr2.Events(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("existing log has %d events; want 1 (untouched)", len(events))
 	}
 }
