@@ -177,8 +177,10 @@ func TestReinjectsAfterSummary(t *testing.T) {
 	writeFile(t, projectFile, "- fact\n")
 	id := createSession(t, mgr)
 	startTurn(t, ctx, mgr, id)
-	// 压缩（compaction）把这次注入折叠到 summary 水位线之后。
-	appendEvent(t, ctx, mgr, id, session.Event{Type: session.Summary, Data: session.MarshalData(session.SummaryData{Content: "SUMMARY"})})
+	// 压缩（compaction）把这次注入折叠到 summary 水位线之后：
+	// 序列此刻为 turn/start(0)、注入的 user/message(1)，summary
+	// 落在序索引 2，ThroughSeq 即其自身位置。
+	appendEvent(t, ctx, mgr, id, session.Event{Type: session.Summary, Data: session.MarshalData(session.SummaryData{Content: "SUMMARY", ThroughSeq: 2})})
 	startTurn(t, ctx, mgr, id)
 
 	msgs := memoryMessages(t, mgr, id)

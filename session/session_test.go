@@ -173,20 +173,22 @@ func TestList(t *testing.T) {
 	}
 }
 
-// TestDeriveMessagesWithSummary 覆盖 summary 窗口：最新 summary
-// 作为一条 user 消息引领投影，它之前的事件被排除，它之后的事件
-// 正常投影。
+// TestDeriveMessagesWithSummary 覆盖 ThroughSeq 水位线：最新 summary
+// 作为一条 user 消息引领投影；水位线之后的事件即使物理上排在 summary
+// 之前，也必须和水位线之后追加的事件一样留在模型视图里。
 func TestDeriveMessagesWithSummary(t *testing.T) {
 	events := append(sampleEvents(),
-		session.Event{Type: session.Summary, Data: session.MarshalData(session.SummaryData{Content: "first summary"})},
-		session.Event{Type: session.UserMessage, Data: session.MarshalData(session.UserMessageData{Content: "old after first"})},
-		session.Event{Type: session.Summary, Data: session.MarshalData(session.SummaryData{Content: "latest summary"})},
-		session.Event{Type: session.UserMessage, Data: session.MarshalData(session.UserMessageData{Content: "after summary"})},
-		session.Event{Type: session.AssistantMessage, Data: session.MarshalData(session.AssistantMessageData{Content: "new answer"})},
+		session.Event{Type: session.Summary, Data: session.MarshalData(session.SummaryData{Content: "first summary", ThroughSeq: 9})},   // 10
+		session.Event{Type: session.UserMessage, Data: session.MarshalData(session.UserMessageData{Content: "covered by latest"})},      // 11
+		session.Event{Type: session.UserMessage, Data: session.MarshalData(session.UserMessageData{Content: "retained before latest"})}, // 12
+		session.Event{Type: session.Summary, Data: session.MarshalData(session.SummaryData{Content: "latest summary", ThroughSeq: 11})}, // 13
+		session.Event{Type: session.UserMessage, Data: session.MarshalData(session.UserMessageData{Content: "after summary"})},          // 14
+		session.Event{Type: session.AssistantMessage, Data: session.MarshalData(session.AssistantMessageData{Content: "new answer"})},   // 15
 	)
 	msgs := session.DeriveMessages(events)
 	want := []llm.Message{
 		{Role: "user", Content: "latest summary"},
+		{Role: "user", Content: "retained before latest"},
 		{Role: "user", Content: "after summary"},
 		{Role: "assistant", Content: "new answer"},
 	}
@@ -302,7 +304,7 @@ func TestDeriveMessagesWithPrune(t *testing.T) {
 		{Type: session.AssistantMessage, Data: session.MarshalData(session.AssistantMessageData{ToolCalls: []llm.ToolCall{call}})},       // 1
 		{Type: session.ToolResult, Data: session.MarshalData(session.ToolResultData{CallID: "c1", Name: "bash", Content: "x-original"})}, // 2
 		{Type: session.Prune, Data: session.MarshalData(session.PruneData{Seq: 2, Content: "x-pruned"})},                                 // 3
-		{Type: session.Summary, Data: session.MarshalData(session.SummaryData{Content: "S"})},                                            // 4
+		{Type: session.Summary, Data: session.MarshalData(session.SummaryData{Content: "S", ThroughSeq: 4})},                             // 4
 		{Type: session.ToolResult, Data: session.MarshalData(session.ToolResultData{CallID: "c2", Name: "bash", Content: "y-original"})}, // 5
 		{Type: session.Prune, Data: session.MarshalData(session.PruneData{Seq: 5, Content: "y-pruned"})},                                 // 6
 		{Type: session.Prune, Data: session.MarshalData(session.PruneData{Seq: 2, Content: "dead"})},                                     // 7 指向水位线之前，落空
@@ -335,7 +337,7 @@ func TestDeriveMessagesWithKeepFirst(t *testing.T) {
 	events := []session.Event{
 		{Type: session.UserMessage, Data: session.MarshalData(session.UserMessageData{Content: "initial goal"})},
 		{Type: session.UserMessage, Data: session.MarshalData(session.UserMessageData{Content: "old"})},
-		{Type: session.Summary, Data: session.MarshalData(session.SummaryData{Content: "S", FirstKept: 1})},
+		{Type: session.Summary, Data: session.MarshalData(session.SummaryData{Content: "S", FirstKept: 1, ThroughSeq: 2})},
 		{Type: session.UserMessage, Data: session.MarshalData(session.UserMessageData{Content: "after"})},
 	}
 	msgs := session.DeriveMessages(events)

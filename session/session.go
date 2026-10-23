@@ -98,13 +98,18 @@ type ToolResultData struct {
 	Error   string `json:"error,omitempty"`
 }
 
-// SummaryData 是一条压缩（compaction）摘要，覆盖它之前的所有事件。
+// SummaryData 是一条压缩（compaction）摘要。ThroughSeq 记录本次
+// 摘要覆盖的最后一条原始事件的序索引：投影以 ThroughSeq+1 为
+// 水位线，序索引大于它的事件——无论是摘要前保留的尾部，还是摘要
+// 前后并发追加的事件——都留在模型视图里。写入方必须总是赋值；
+// 缺省 0 没有特殊含义，只表示「覆盖到序索引 0」。
 type SummaryData struct {
 	Content string `json:"content"`
 	// FirstKept 钉住日志开头不参与压缩的事件条数：投影时前
 	// FirstKept 条原始事件排在摘要领投消息之前，永远保持模型
 	// 可见。缺省 0 是旧行为（不保留），旧日志无需迁移。
-	FirstKept int `json:"first_kept,omitempty"`
+	FirstKept  int `json:"first_kept,omitempty"`
+	ThroughSeq int `json:"through_seq"`
 }
 
 // PruneData 记录一次剪枝（compaction 的无模型调用前奏）：被剪事件
@@ -449,26 +454,24 @@ func (l *FileLog) Close() error {
 
 // DeriveMessages 是从日志到模型历史的唯一投影：assistant
 // 分片聚合成一条 assistant 消息，完整的 assistant/message
-// 取代分片缓冲。最新的 summary 事件重置投影窗口：其内容
-// 作为一条 user 消息排在结果最前，只有它之后的事件参与
-// 投影；更早的事件仍留在日志里，但退出模型可见的
-// 历史。summary 的 FirstKept 钉住日志开头的原始事件：前
-// FirstKept 条按原样投影，排在摘要领投消息之前。prune 事件
-// 按序索引回改：它指向的 tool/result 事件的投影内容被替换
-// 为剪枝后的文本。
+// 取代分片缓冲。最新有效 summary 以 ThroughSeq+1 为水位线：
+// 其内容作为 user 消息领投，水位线之后的事件无论物理上位于
+// summary 前后都参与投影；已覆盖事件仍留在日志里，但退出模型
+// 视图。FirstKept 钉住日志开头的原始事件，排在摘要之前且不得
+// 越过水位线。prune 按序索引回改 tool/result 的投影内容。
 func DeriveMessages(events []Event) []llm.Message {
 	start := 0
 	summary := ""
 	firstKept := 0
 	pruned := map[int]string{}
-	for i, ev := range events {
+	for _, ev := range events {
 		switch ev.Type {
 		case Summary:
-			start = i + 1
 			var d SummaryData
 			if json.Unmarshal(ev.Data, &d) == nil {
 				summary = d.Content
 				firstKept = d.FirstKept
+				start = d.ThroughSeq + 1
 			}
 		case Prune:
 			var d PruneData

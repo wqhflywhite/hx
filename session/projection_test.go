@@ -107,13 +107,16 @@ func TestMessagesMatchesDeriveMessages(t *testing.T) {
 		{Type: session.ToolResult, Data: session.MarshalData(session.ToolResultData{CallID: "c2", Name: "bash", Error: "net down"})},
 		{Type: session.AssistantMessage, Data: session.MarshalData(session.AssistantMessageData{Content: "final answer"})},
 		{Type: session.TurnEnd, Data: session.MarshalData(session.TurnEndData{Session: id})},
-		// summary 重置窗口；它之前悬而未决的分片被丢弃。
-		{Type: session.Summary, Data: session.MarshalData(session.SummaryData{Content: "first summary"})},
+		// summary 重置窗口；水位线之前悬而未决的分片被丢弃，但序索引
+		// 19、20 虽排在 summary 之前，仍因 ThroughSeq=18 而保留。
+		{Type: session.Summary, Data: session.MarshalData(session.SummaryData{Content: "first summary", ThroughSeq: 18})},
 		{Type: session.UserMessage, Data: session.MarshalData(session.UserMessageData{Content: "old after first"})},
 		{Type: session.AssistantChunk, Data: session.MarshalData(session.AssistantChunkData{Delta: "x"})},
 		{Type: session.AssistantChunk, Data: session.MarshalData(session.AssistantChunkData{Delta: "y"})},
 		// FirstKept=1 钉住日志开头的 user/message，随窗口重置重投。
-		{Type: session.Summary, Data: session.MarshalData(session.SummaryData{Content: "latest summary", FirstKept: 1})},
+		// ThroughSeq=22 保留序索引 23、24 的分片；当前 summary 自身
+		// 作为边界收尾这些分片。
+		{Type: session.Summary, Data: session.MarshalData(session.SummaryData{Content: "latest summary", FirstKept: 1, ThroughSeq: 22})},
 		{Type: session.UserMessage, Data: session.MarshalData(session.UserMessageData{Content: "after summary"})},
 		{Type: session.AssistantChunk, Data: session.MarshalData(session.AssistantChunkData{Delta: "new "})},
 		{Type: session.AssistantMessage, Data: session.MarshalData(session.AssistantMessageData{Content: "new answer"})},
@@ -123,6 +126,15 @@ func TestMessagesMatchesDeriveMessages(t *testing.T) {
 		{Type: session.Prune, Data: session.MarshalData(session.PruneData{Seq: 29, Content: "[pruned] fresh"})},
 		// 无边界收尾的尾巴：结尾的收尾仍会把它投影出来。
 		{Type: session.AssistantChunk, Data: session.MarshalData(session.AssistantChunkData{Delta: "tail"})},
+		// 最后一条 summary 只覆盖到序索引 30，保留它之前的
+		// tool/result(31) 与 prune(32)；增量重放不能丢剪枝结果。
+		{Type: session.ToolResult, Data: session.MarshalData(session.ToolResultData{CallID: "c4", Name: "bash", Content: "retained original"})},
+		{Type: session.Prune, Data: session.MarshalData(session.PruneData{Seq: 31, Content: "[pruned] retained"})},
+		{Type: session.Summary, Data: session.MarshalData(session.SummaryData{Content: "final summary", ThroughSeq: 30})},
+		{Type: session.UserMessage, Data: session.MarshalData(session.UserMessageData{Content: "after final"})},
+		// FirstKept 不得越过 ThroughSeq+1：全量投影会把头部截到
+		// 一条，增量若按物理位置重投四条会重复投影序索引 1～3。
+		{Type: session.Summary, Data: session.MarshalData(session.SummaryData{Content: "clamped head", FirstKept: 4, ThroughSeq: 0})},
 	}
 	for i, ev := range script {
 		if err := store.Append(ctx, ev); err != nil {
@@ -130,6 +142,12 @@ func TestMessagesMatchesDeriveMessages(t *testing.T) {
 		}
 		assertProjectionEqual(t, mgr, dir, id, i+1)
 	}
+	// 冷缓存 resume 也必须从同一份磁盘日志重建出完全相同的视图。
+	resumed, err := session.NewManager(dir, fixedClock(), idGen())
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertProjectionEqual(t, resumed, dir, id, len(script)+1)
 }
 
 // TestMessagesAfterRestart 覆盖 kill -9 路径：在同一目录上新建的

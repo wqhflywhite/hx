@@ -73,26 +73,39 @@ func (p *projection) foldEvent(seq int, ev Event) {
 	}
 }
 
+func (p *projection) applyPrune(ev Event) {
+	var d PruneData
+	if json.Unmarshal(ev.Data, &d) == nil {
+		if mi, ok := p.toolSeqs[d.Seq]; ok {
+			p.msgs[mi].Content = d.Content
+		}
+	}
+}
+
 // fold 折叠一个事件（序索引为 p.wm），以增量方式复刻
 // DeriveMessages 的行为：分片聚合、完整消息取代、边界收尾、
-// summary 窗口重置（含 FirstKept 前缀重投），以及 prune 回改。
+// summary 按 ThroughSeq 重建窗口，以及 prune 回改。
 func (p *projection) fold(ev Event) {
 	switch ev.Type {
 	case Summary:
-		// summary 重置投影窗口：其内容作为一条 user 消息排在
-		// 结果最前，只有之后的事件保持模型可见；FirstKept 钉住的
-		// 日志开头按原样重投，排在摘要之前。解码失败的 summary
-		// 会保留之前的内容与 FirstKept，与 DeriveMessages 的
-		// 第一遍扫描一致。
-		p.pending = nil
+		// 有效 summary 以 ThroughSeq+1 为水位线：重投 FirstKept
+		// 头部与摘要，再重放水位线到当前物理位置之间的保留尾部。
+		// 解码失败只收尾分片，不改变既有窗口。
 		var d SummaryData
-		if json.Unmarshal(ev.Data, &d) == nil {
-			p.summary = d.Content
-			p.firstKept = d.FirstKept
+		if json.Unmarshal(ev.Data, &d) != nil {
+			p.flushPending()
+			return
 		}
+
+		p.pending = nil
+		p.summary = d.Content
+		p.firstKept = d.FirstKept
 		p.msgs = nil
 		p.toolSeqs = nil
-		k := min(p.firstKept, p.wm)
+
+		start := d.ThroughSeq + 1
+
+		k := min(p.firstKept, start)
 		for i := 0; i < k; i++ {
 			p.foldEvent(i, p.events[i])
 		}
@@ -100,16 +113,26 @@ func (p *projection) fold(ev Event) {
 			p.flushPending()
 			p.msgs = append(p.msgs, llm.Message{Role: "user", Content: p.summary})
 		}
+
+		for i := start; i < p.wm; i++ {
+			p.foldEvent(i, p.events[i])
+		}
+
+		// 全量投影会先收集 prune 再投影，因此重建后统一回改仍可见的
+		// 工具消息；已经退出窗口的目标不在 toolSeqs 中，会自然落空。
+		for i := 0; i < p.wm; i++ {
+			if p.events[i].Type == Prune {
+				p.applyPrune(p.events[i])
+			}
+		}
+
+		// 当前 summary 自身也是投影边界，负责收尾保留尾部的分片。
+		p.flushPending()
 	case Prune:
 		// 回改已投影的 tool 消息。指向窗口外（序索引未投影出
 		// tool 消息）的 prune 自然落空：summary 重置已清掉
 		// 覆盖区间的序索引映射。
-		var d PruneData
-		if json.Unmarshal(ev.Data, &d) == nil {
-			if mi, ok := p.toolSeqs[d.Seq]; ok {
-				p.msgs[mi].Content = d.Content
-			}
-		}
+		p.applyPrune(ev)
 	default:
 		p.foldEvent(p.wm, ev)
 	}

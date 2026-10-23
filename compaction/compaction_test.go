@@ -27,13 +27,22 @@ import (
 )
 
 // fakeAdapter 对每个请求都回复同一段固定内容，并记录收到的请求。
+// started/release 可让并发追加测试把摘要调用停在模型响应之前。
 type fakeAdapter struct {
 	response string
 	reqs     []*llm.Request
+	started  chan struct{}
+	release  chan struct{}
 }
 
 func (f *fakeAdapter) Stream(_ context.Context, req *llm.Request) iter.Seq[llm.Chunk] {
 	f.reqs = append(f.reqs, req)
+	if f.started != nil {
+		close(f.started)
+	}
+	if f.release != nil {
+		<-f.release
+	}
 	response := f.response
 	return func(yield func(llm.Chunk) bool) {
 		yield(llm.Chunk{Delta: response})
@@ -116,6 +125,11 @@ func TestCompactsOverBudget(t *testing.T) {
 	if err := json.Unmarshal(last.Data, &d); err != nil || d.Content != "SUMMARY" {
 		t.Fatalf("summary payload = %s; want SUMMARY", last.Data)
 	}
+	// 摘要显式声明覆盖范围：keep_recent=2 留下序索引 2、3，
+	// 因此水位线覆盖到序索引 1。
+	if d.ThroughSeq != 1 {
+		t.Fatalf("ThroughSeq = %d; want 1 (covers seqs 0-1)", d.ThroughSeq)
+	}
 
 	// keep_recent 把尾部两条事件挡在了摘要器的转录文本之外，它们不参与
 	// 本次摘要。
@@ -130,11 +144,105 @@ func TestCompactsOverBudget(t *testing.T) {
 		t.Fatalf("transcript includes kept-recent events: %q", transcript)
 	}
 
-	// 摘要是位置水位线：投影 = 摘要 + 其后落盘的事件（刚压缩完时后面
-	// 还没有任何东西）。
+	// ThroughSeq 水位线：被 keep_recent 挡在摘要输入之外的尾部事件
+	// 没有被摘要覆盖，必须仍留在投影里——摘要领投，尾部跟随。
 	msgs := session.DeriveMessages(events)
-	if len(msgs) != 1 || msgs[0].Role != "user" || msgs[0].Content != "SUMMARY" {
-		t.Fatalf("projection = %+v; want just the summary", msgs)
+	if len(msgs) != 3 || msgs[0].Content != "SUMMARY" ||
+		msgs[1].Content != "recent question" || msgs[2].Content != "recent answer" {
+		t.Fatalf("projection = %+v; want summary + kept-recent tail", msgs)
+	}
+}
+
+// TestCompactionKeepsEventsAppendedDuringSummary 把模型调用停在响应前，
+// 模拟摘要期间另一路追加事件。summary 只能覆盖它实际读过的事件，
+// 并发追加的 user/message 与 tool/result 必须仍在投影里。
+func TestCompactionKeepsEventsAppendedDuringSummary(t *testing.T) {
+	ctx, compactor, mgr, adapter := newCompactor(t, map[string]any{"max_context_tokens": 1, "keep_recent_events": 1, "keep_first_events": 0})
+	store, id, err := mgr.Create()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.(interface{ Close() error }).Close()
+	appendAll(t, ctx, store, []session.Event{
+		{Type: session.UserMessage, Data: session.MarshalData(session.UserMessageData{Content: "old question"})},
+		{Type: session.AssistantMessage, Data: session.MarshalData(session.AssistantMessageData{Content: "old answer"})},
+		{Type: session.UserMessage, Data: session.MarshalData(session.UserMessageData{Content: "kept recent"})},
+	})
+	// 先建立热增量投影，确保最终断言覆盖 summary 后到的 fold 路径。
+	if _, err := mgr.Messages(id); err != nil {
+		t.Fatal(err)
+	}
+
+	adapter.started = make(chan struct{})
+	adapter.release = make(chan struct{})
+	released := false
+	defer func() {
+		if !released {
+			close(adapter.release)
+		}
+	}()
+	type result struct {
+		done bool
+		err  error
+	}
+	resultCh := make(chan result, 1)
+	go func() {
+		done, err := compactor.MaybeCompact(ctx, context.Background(), store, id)
+		resultCh <- result{done: done, err: err}
+	}()
+	select {
+	case <-adapter.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("summarizer did not start")
+	}
+
+	appendAll(t, ctx, store, []session.Event{
+		{Type: session.UserMessage, Data: session.MarshalData(session.UserMessageData{Content: "concurrent question"})},
+		{Type: session.ToolResult, Data: session.MarshalData(session.ToolResultData{CallID: "c1", Name: "bash", Content: "concurrent result"})},
+	})
+	if _, err := mgr.Messages(id); err != nil {
+		t.Fatal(err)
+	}
+	close(adapter.release)
+	released = true
+	select {
+	case got := <-resultCh:
+		if got.err != nil || !got.done {
+			t.Fatalf("compaction: done=%v err=%v", got.done, got.err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("compaction did not finish")
+	}
+
+	events, err := mgr.Events(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var d session.SummaryData
+	if err := json.Unmarshal(events[len(events)-1].Data, &d); err != nil || d.ThroughSeq != 1 {
+		t.Fatalf("summary payload = %s; want through_seq 1", events[len(events)-1].Data)
+	}
+	if transcript := adapter.reqs[0].Messages[1].Content; strings.Contains(transcript, "concurrent") {
+		t.Fatalf("summarizer unexpectedly read concurrent events: %q", transcript)
+	}
+	want := []llm.Message{
+		{Role: "user", Content: "SUMMARY"},
+		{Role: "user", Content: "kept recent"},
+		{Role: "user", Content: "concurrent question"},
+		{Role: "tool", ToolCallID: "c1", Content: "concurrent result"},
+	}
+	got, err := mgr.Messages(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotRaw, _ := json.Marshal(got)
+	wantRaw, _ := json.Marshal(want)
+	if string(gotRaw) != string(wantRaw) {
+		t.Fatalf("Messages = %s; want %s", gotRaw, wantRaw)
+	}
+	fullRaw, _ := json.Marshal(session.DeriveMessages(events))
+	if string(fullRaw) != string(wantRaw) {
+		t.Fatalf("DeriveMessages = %s; want %s", fullRaw, wantRaw)
 	}
 }
 
@@ -332,8 +440,14 @@ func TestRollingDistillation(t *testing.T) {
 	if !strings.Contains(transcript, "SUMMARY-1") {
 		t.Fatalf("second transcript dropped the previous summary: %q", transcript)
 	}
+	if !strings.Contains(transcript, "kept recent") {
+		t.Fatalf("second transcript skipped the tail retained by the first summary: %q", transcript)
+	}
 	if !strings.Contains(transcript, "round two question") {
 		t.Fatalf("second transcript misses the new events: %q", transcript)
+	}
+	if strings.Contains(transcript, "round two answer") {
+		t.Fatalf("second transcript includes the new kept-recent tail: %q", transcript)
 	}
 }
 
@@ -408,15 +522,17 @@ func TestKeepFirstPinsInitialGoal(t *testing.T) {
 	}
 	last := events[len(events)-1]
 	var d session.SummaryData
-	if err := json.Unmarshal(last.Data, &d); err != nil || d.FirstKept != 1 {
-		t.Fatalf("summary payload = %s; want first_kept 1", last.Data)
+	if err := json.Unmarshal(last.Data, &d); err != nil || d.FirstKept != 1 || d.ThroughSeq != 2 {
+		t.Fatalf("summary payload = %s; want first_kept 1 and through_seq 2", last.Data)
 	}
 
-	// 刚压缩完时水位线之后还没有事件：投影 = 钉住的首条 + 摘要
-	// 领投。追加一条新事件后它排在摘要之后。
+	// 投影保留钉住的首条、摘要，以及未进 transcript 的 keep_recent
+	// 尾部。追加的新事件排在整条保留尾部之后。
 	want := []llm.Message{
 		{Role: "user", Content: "initial goal"},
 		{Role: "user", Content: "SUMMARY"},
+		{Role: "user", Content: "recent question"},
+		{Role: "assistant", Content: "recent answer"},
 	}
 	assertEqual := func(name string, got []llm.Message) {
 		t.Helper()
@@ -476,16 +592,17 @@ func TestKeepFirstKeepsToolPairsTogether(t *testing.T) {
 		t.Fatal(err)
 	}
 	var d session.SummaryData
-	if err := json.Unmarshal(events[len(events)-1].Data, &d); err != nil || d.FirstKept != 4 {
-		t.Fatalf("summary payload = %s; want first_kept 4", events[len(events)-1].Data)
+	if err := json.Unmarshal(events[len(events)-1].Data, &d); err != nil || d.FirstKept != 4 || d.ThroughSeq != 5 {
+		t.Fatalf("summary payload = %s; want first_kept 4 and through_seq 5", events[len(events)-1].Data)
 	}
 	transcript := adapter.reqs[0].Messages[1].Content
 	if strings.Contains(transcript, "pair result") || strings.Contains(transcript, "initial goal") {
 		t.Fatalf("pinned head leaked into the transcript: %q", transcript)
 	}
 	msgs := session.DeriveMessages(events)
-	if len(msgs) < 3 || msgs[2].Role != "tool" || msgs[2].Content != "pair result" {
-		t.Fatalf("projection split the pinned tool pair: %+v", msgs)
+	if len(msgs) != 6 || msgs[2].Role != "tool" || msgs[2].Content != "pair result" ||
+		msgs[4].Content != "recent question" || msgs[5].Content != "recent answer" {
+		t.Fatalf("projection split the pinned pair or dropped the recent tail: %+v", msgs)
 	}
 }
 

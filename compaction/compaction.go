@@ -64,11 +64,12 @@ func (b *basic) MaybeCompact(c *fiber.Context, ctx context.Context, store sessio
 		return false, nil
 	}
 
-	// 最新一条 summary 是水位线：只有它之后的事件才是候选。其载荷
-	// 同时是滚动蒸馏的前情与 keep_first 的既有口径。
+	// 最新一条 summary 提供覆盖水位线：候选从 ThroughSeq+1 开始，
+	// 其载荷同时是滚动蒸馏的前情与 keep_first 的既有口径。
 	lastSummary := -1
 	prevSummary := ""
 	prevFirstKept := 0
+	prevThroughSeq := -1
 	for i, ev := range events {
 		if ev.Type == session.Summary {
 			lastSummary = i
@@ -76,6 +77,7 @@ func (b *basic) MaybeCompact(c *fiber.Context, ctx context.Context, store sessio
 			if json.Unmarshal(ev.Data, &d) == nil {
 				prevSummary = d.Content
 				prevFirstKept = d.FirstKept
+				prevThroughSeq = d.ThroughSeq
 			}
 		}
 	}
@@ -114,7 +116,8 @@ func (b *basic) MaybeCompact(c *fiber.Context, ctx context.Context, store sessio
 	}
 
 	// 尾部 keepRecent 条事件保持不动。
-	head := events[lastSummary+1:]
+
+	head := events[prevThroughSeq+1:]
 	if len(head) <= b.keepRecent {
 		return pruned, nil
 	}
@@ -149,10 +152,17 @@ func (b *basic) MaybeCompact(c *fiber.Context, ctx context.Context, store sessio
 	if prevSummary != "" {
 		transcript.WriteString("Summary of earlier events:\n")
 		transcript.WriteString(prevSummary)
-		transcript.WriteString("\n\nEvents since that summary:\n")
+		transcript.WriteString("\n\nEvents not covered by that summary:\n")
 	}
-	for _, ev := range toSummarize {
+	throughSeq := prevThroughSeq
+	for i, ev := range toSummarize {
+		if ev.Type != session.Summary && ev.Type != session.Prune {
+			throughSeq = prevThroughSeq + 1 + start + i
+		}
 		transcript.WriteString(renderEvent(ev))
+	}
+	if throughSeq == prevThroughSeq {
+		return pruned, nil
 	}
 	req := &llm.Request{Messages: []llm.Message{
 		{Role: "system", Content: b.prompt},
@@ -176,7 +186,7 @@ func (b *basic) MaybeCompact(c *fiber.Context, ctx context.Context, store sessio
 	// 摘要对模型可见，因此它像其他模型输入一样走会话日志：先写入、再
 	// 广播（store 两件事都做）。summary 领投后，其覆盖区间的 prune
 	// 自然失效——水位线之前的事件不再投影，prune 的回改随之落空。
-	data := session.MarshalData(session.SummaryData{Content: string(summary), FirstKept: keepFirst})
+	data := session.MarshalData(session.SummaryData{Content: string(summary), FirstKept: keepFirst, ThroughSeq: throughSeq})
 	if err := store.Append(c, session.Event{Type: session.Summary, Data: data}); err != nil {
 		return false, err
 	}
