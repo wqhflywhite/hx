@@ -147,106 +147,121 @@ type kbPlugin struct{}
 
 func (kbPlugin) Name() string     { return "kb" }
 func (kbPlugin) Inject() []string { return []string{"tools"} }
-func (kbPlugin) Apply(c *fiber.Context, cfg map[string]any) error {
-	if cfg == nil {
-		// 默认装配不带配置挂载 kb；没配 vault 时插件是空操作，
-		// 而不是启动失败。
+func (kbPlugin) Apply(c *fiber.Context, raw map[string]any) error {
+	if raw == nil {
+		// 默认装配不带配置挂载 kb；没配 vault 时插件是空操作。
 		return nil
 	}
-	vaultRaw, err := configString(cfg, "vault", "")
+	cfg, err := parseKBConfig(raw)
 	if err != nil {
 		return err
+	}
+	if info, err := os.Stat(cfg.vaultRoot); err != nil || !info.IsDir() {
+		return fmt.Errorf("kb: vault %q is not a directory: %w", cfg.vaultRoot, err)
+	}
+	if err := os.MkdirAll(filepath.Dir(cfg.indexPath), 0o755); err != nil {
+		return err
+	}
+	return c.Effect(func(c *fiber.Context) (fiber.Disposer, error) {
+		return mountKB(c, cfg)
+	})
+}
+
+// kbConfig 是完成路径解析和默认值求值后的 KB 挂载配置。
+type kbConfig struct {
+	vaultRoot     string
+	indexPath     string
+	debounceMs    int
+	searchLimit   int
+	lintMaxChunks int
+	ftsWeight     *float64
+	vecWeight     *float64
+	embedder      embed.Embedder
+}
+
+// parseKBConfig 只解析配置，不创建目录或打开索引。
+func parseKBConfig(raw map[string]any) (kbConfig, error) {
+	var cfg kbConfig
+	vaultRaw, err := configString(raw, "vault", "")
+	if err != nil {
+		return cfg, err
 	}
 	if vaultRaw == "" {
-		return fmt.Errorf("kb: %q is required", "vault")
+		return cfg, fmt.Errorf("kb: %q is required", "vault")
 	}
-	vaultRoot, err := resolve(vaultRaw)
+	if cfg.vaultRoot, err = resolve(vaultRaw); err != nil {
+		return cfg, err
+	}
+	indexRaw, err := configString(raw, "index", filepath.Join(cfg.vaultRoot, ".hx", "kb.db"))
 	if err != nil {
-		return err
+		return cfg, err
 	}
-	indexRaw, err := configString(cfg, "index", filepath.Join(vaultRoot, ".hx", "kb.db"))
-	if err != nil {
-		return err
+	if cfg.indexPath, err = resolve(indexRaw); err != nil {
+		return cfg, err
 	}
-	indexPath, err := resolve(indexRaw)
-	if err != nil {
-		return err
+	if cfg.debounceMs, err = configInt(raw, "debounce_ms", defaultDebounceMs); err != nil {
+		return cfg, err
 	}
-	debounce, err := configInt(cfg, "debounce_ms", defaultDebounceMs)
-	if err != nil {
-		return err
+	if cfg.searchLimit, err = configInt(raw, "search_limit", defaultSearchLimit); err != nil {
+		return cfg, err
 	}
-	limit, err := configInt(cfg, "search_limit", defaultSearchLimit)
-	if err != nil {
-		return err
+	if cfg.lintMaxChunks, err = configInt(raw, "lint_max_chunks", defaultLintMaxChunks); err != nil {
+		return cfg, err
 	}
-	lintMaxChunks, err := configInt(cfg, "lint_max_chunks", defaultLintMaxChunks)
-	if err != nil {
-		return err
+	if cfg.ftsWeight, err = configFloatPtr(raw, "fts_weight"); err != nil {
+		return cfg, err
 	}
-	ftsWeight, err := configFloatPtr(cfg, "fts_weight")
-	if err != nil {
-		return err
+	if cfg.vecWeight, err = configFloatPtr(raw, "vector_weight"); err != nil {
+		return cfg, err
 	}
-	vecWeight, err := configFloatPtr(cfg, "vector_weight")
-	if err != nil {
-		return err
+	if cfg.embedder, err = configEmbedder(raw); err != nil {
+		return cfg, err
 	}
-	emb, err := configEmbedder(cfg)
-	if err != nil {
-		return err
-	}
-	if emb != nil && ftsWeight == nil && vecWeight == nil {
-		// 配置 embedder 即声明要混合检索；没有显式权重时
-		// 混合默认两边均分。任一侧显式写 0 则保持
-		// 该信号关闭。
+	if cfg.embedder != nil && cfg.ftsWeight == nil && cfg.vecWeight == nil {
+		// 配置 embedder 即声明要混合检索；显式 0 仍关闭对应信号。
 		one := 1.0
-		ftsWeight, vecWeight = &one, &one
+		cfg.ftsWeight, cfg.vecWeight = &one, &one
 	}
-	if info, err := os.Stat(vaultRoot); err != nil || !info.IsDir() {
-		return fmt.Errorf("kb: vault %q is not a directory: %w", vaultRoot, err)
-	}
-	if err := os.MkdirAll(filepath.Dir(indexPath), 0o755); err != nil {
-		return err
-	}
+	return cfg, nil
+}
 
-	return c.Effect(func(c *fiber.Context) (fiber.Disposer, error) {
-		idx, err := index.Open(indexPath)
-		if err != nil {
-			return nil, err
-		}
-		svc := NewService(vaultRoot, idx, emb, ftsWeight, vecWeight, limit, lintMaxChunks)
-		fail := func(err error) (fiber.Disposer, error) {
-			_ = idx.Close()
-			return nil, err
-		}
-		if err := svc.Sync(); err != nil {
-			return fail(err)
-		}
-		wd, err := watch(c, svc, vaultRoot, time.Duration(debounce)*time.Millisecond)
-		if err != nil {
-			return fail(err)
-		}
-		reg, ok := fiber.Get[*tools.Registry](c, "tools")
-		if !ok {
-			_ = wd()
-			return fail(fmt.Errorf("kb: tools service unavailable"))
-		}
-		d0 := fiber.Provide[KB](c, "kb", svc)
-		d1 := reg.Register(searchTool{svc})
-		d2 := reg.Register(readTool{svc})
-		d3 := reg.Register(writeTool{svc})
-		d4 := reg.Register(lintTool{svc})
-		d5 := registerLibrarian(c)
-		return func() error {
-			for _, d := range []fiber.Disposer{d5, d4, d3, d2, d1, d0, wd} {
-				if err := d(); err != nil {
-					return err
-				}
+// mountKB 打开并同步索引，注册 watcher、服务与工具，返回逆序清理器。
+func mountKB(c *fiber.Context, cfg kbConfig) (fiber.Disposer, error) {
+	idx, err := index.Open(cfg.indexPath)
+	if err != nil {
+		return nil, err
+	}
+	svc := NewService(cfg.vaultRoot, idx, cfg.embedder, cfg.ftsWeight, cfg.vecWeight, cfg.searchLimit, cfg.lintMaxChunks)
+	fail := func(err error) (fiber.Disposer, error) {
+		_ = idx.Close()
+		return nil, err
+	}
+	if err := svc.Sync(); err != nil {
+		return fail(err)
+	}
+	wd, err := watch(c, svc, cfg.vaultRoot, time.Duration(cfg.debounceMs)*time.Millisecond)
+	if err != nil {
+		return fail(err)
+	}
+	reg, ok := fiber.Get[*tools.Registry](c, "tools")
+	if !ok {
+		_ = wd()
+		return fail(fmt.Errorf("kb: tools service unavailable"))
+	}
+	d0 := fiber.Provide[KB](c, "kb", svc)
+	d1 := reg.Register(searchTool{svc})
+	d2 := reg.Register(readTool{svc})
+	d3 := reg.Register(writeTool{svc})
+	d4 := reg.Register(lintTool{svc})
+	d5 := registerLibrarian(c)
+	return func() error {
+		for _, d := range []fiber.Disposer{d5, d4, d3, d2, d1, d0, wd} {
+			if err := d(); err != nil {
+				return err
 			}
-			return idx.Close()
-		}, nil
-	})
+		}
+		return idx.Close()
+	}, nil
 }
 
 func init() { plugin.Register(Plugin()) }

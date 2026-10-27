@@ -460,90 +460,105 @@ func (l *FileLog) Close() error {
 // 视图。FirstKept 钉住日志开头的原始事件，排在摘要之前且不得
 // 越过水位线。prune 按序索引回改 tool/result 的投影内容。
 func DeriveMessages(events []Event) []llm.Message {
-	start := 0
-	summary := ""
-	firstKept := 0
-	pruned := map[int]string{}
+	window := scanDeriveWindow(events)
+	builder := messageBuilder{pruned: window.pruned}
+	for i := 0; i < window.firstKept; i++ {
+		builder.add(i, events[i])
+	}
+	if window.summary != "" {
+		builder.flush()
+		builder.msgs = append(builder.msgs, llm.Message{Role: "user", Content: window.summary})
+	}
+	for i := window.start; i < len(events); i++ {
+		builder.add(i, events[i])
+	}
+	builder.flush()
+	return builder.msgs
+}
+
+// deriveWindow 是全量投影的覆盖范围与全部 prune 回改。
+type deriveWindow struct {
+	start     int
+	summary   string
+	firstKept int
+	pruned    map[int]string
+}
+
+// scanDeriveWindow 找最新有效 summary，并收集最后生效的 prune 内容。
+func scanDeriveWindow(events []Event) deriveWindow {
+	window := deriveWindow{pruned: map[int]string{}}
 	for _, ev := range events {
 		switch ev.Type {
 		case Summary:
 			var d SummaryData
 			if json.Unmarshal(ev.Data, &d) == nil {
-				summary = d.Content
-				firstKept = d.FirstKept
-				start = d.ThroughSeq + 1
+				window.summary = d.Content
+				window.firstKept = d.FirstKept
+				window.start = d.ThroughSeq + 1
 			}
 		case Prune:
 			var d PruneData
 			if json.Unmarshal(ev.Data, &d) == nil {
-				pruned[d.Seq] = d.Content
+				window.pruned[d.Seq] = d.Content
 			}
 		}
 	}
 	// 防御手写的越界 FirstKept：钉住的前缀不得越过水位线。
-	if firstKept > start {
-		firstKept = start
+	window.firstKept = min(window.firstKept, window.start)
+	return window
+}
+
+// messageBuilder 按事件序构造全量投影，聚合分片并应用 prune。
+type messageBuilder struct {
+	msgs    []llm.Message
+	pending []byte
+	pruned  map[int]string
+}
+
+func (b *messageBuilder) flush() {
+	if len(b.pending) > 0 {
+		b.msgs = append(b.msgs, llm.Message{Role: "assistant", Content: string(b.pending)})
+		b.pending = nil
 	}
-	var msgs []llm.Message
-	var pending []byte
-	flush := func() {
-		if len(pending) > 0 {
-			msgs = append(msgs, llm.Message{Role: "assistant", Content: string(pending)})
-			pending = nil
+}
+
+func (b *messageBuilder) add(seq int, ev Event) {
+	switch ev.Type {
+	case UserMessage:
+		b.flush()
+		var d UserMessageData
+		if json.Unmarshal(ev.Data, &d) == nil {
+			b.msgs = append(b.msgs, llm.Message{Role: "user", Content: d.Content})
 		}
-	}
-	project := func(seq int, ev Event) {
-		switch ev.Type {
-		case UserMessage:
-			flush()
-			var d UserMessageData
-			if json.Unmarshal(ev.Data, &d) == nil {
-				msgs = append(msgs, llm.Message{Role: "user", Content: d.Content})
-			}
-		case AssistantChunk:
-			var d AssistantChunkData
-			if json.Unmarshal(ev.Data, &d) == nil {
-				pending = append(pending, d.Delta...)
-			}
-		case AssistantMessage:
-			// 完整消息取代已聚合的分片。
-			pending = nil
-			var d AssistantMessageData
-			if json.Unmarshal(ev.Data, &d) == nil {
-				msgs = append(msgs, llm.Message{Role: "assistant", Content: d.Content, ToolCalls: d.ToolCalls})
-			}
-		case ToolResult:
-			flush()
-			var d ToolResultData
-			if json.Unmarshal(ev.Data, &d) == nil {
-				content := d.Content
-				if d.Error != "" {
-					content = d.Error
-				}
-				if pc, ok := pruned[seq]; ok {
-					content = pc
-				}
-				msgs = append(msgs, llm.Message{Role: "tool", ToolCallID: d.CallID, Content: content})
-			}
-		default:
-			// turn/step 边界（以及投影区间内不产出消息的
-			// summary/prune 自身）会收尾任何悬而未决的分片
-			// 聚合，使崩溃的 turn 仍贡献其部分内容。
-			flush()
+	case AssistantChunk:
+		var d AssistantChunkData
+		if json.Unmarshal(ev.Data, &d) == nil {
+			b.pending = append(b.pending, d.Delta...)
 		}
+	case AssistantMessage:
+		// 完整消息取代已聚合的分片。
+		b.pending = nil
+		var d AssistantMessageData
+		if json.Unmarshal(ev.Data, &d) == nil {
+			b.msgs = append(b.msgs, llm.Message{Role: "assistant", Content: d.Content, ToolCalls: d.ToolCalls})
+		}
+	case ToolResult:
+		b.flush()
+		var d ToolResultData
+		if json.Unmarshal(ev.Data, &d) == nil {
+			content := d.Content
+			if d.Error != "" {
+				content = d.Error
+			}
+			if pc, ok := b.pruned[seq]; ok {
+				content = pc
+			}
+			b.msgs = append(b.msgs, llm.Message{Role: "tool", ToolCallID: d.CallID, Content: content})
+		}
+	default:
+		// turn/step 边界和控制事件会收尾悬而未决的分片。
+		b.flush()
 	}
-	for i := 0; i < firstKept; i++ {
-		project(i, events[i])
-	}
-	if summary != "" {
-		flush()
-		msgs = append(msgs, llm.Message{Role: "user", Content: summary})
-	}
-	for i := start; i < len(events); i++ {
-		project(i, events[i])
-	}
-	flush()
-	return msgs
 }
 
 // Plugin 把 Manager 暴露为 "sessions" 服务。配置键："dir"、

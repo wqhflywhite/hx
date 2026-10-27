@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"iter"
 	"net/http"
 	"os"
@@ -136,124 +137,154 @@ type streamResponse struct {
 // 工具调用的增量会被累积，完整后一次性产出。
 func (a *Adapter) Stream(ctx context.Context, req *llm.Request) iter.Seq[llm.Chunk] {
 	return func(yield func(llm.Chunk) bool) {
-		model := req.Model
-		if model == "" {
-			model = a.cfg.Model
-		}
-		body := requestBody{Model: model, Messages: wireMessages(req.Messages), Stream: true}
-		for _, t := range req.Tools {
-			var def toolDefinition
-			def.Type = "function"
-			def.Function.Name = t.Name
-			def.Function.Description = t.Description
-			def.Function.Parameters = t.Parameters
-			body.Tools = append(body.Tools, def)
-		}
-		raw, err := json.Marshal(body)
-		if err != nil {
-			yield(llm.Chunk{Err: err})
-			return
-		}
-
-		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost,
-			a.cfg.BaseURL+"/chat/completions", bytes.NewReader(raw))
-		if err != nil {
-			yield(llm.Chunk{Err: err})
-			return
-		}
-		httpReq.Header.Set("Content-Type", "application/json")
-		httpReq.Header.Set("Accept", "text/event-stream")
-		if a.cfg.APIKey != "" {
-			httpReq.Header.Set("Authorization", "Bearer "+a.cfg.APIKey)
-		}
-
-		resp, err := a.client.Do(httpReq)
+		resp, err := a.openStream(ctx, a.streamBody(req))
 		if err != nil {
 			yield(llm.Chunk{Err: err})
 			return
 		}
 		defer resp.Body.Close()
-		if resp.StatusCode != http.StatusOK {
-			var msg [4096]byte
-			n, _ := resp.Body.Read(msg[:])
-			yield(llm.Chunk{Err: fmt.Errorf("deepseek: HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(msg[:n])))})
+		consumeStream(ctx, resp.Body, yield)
+	}
+}
+
+// streamBody 构造 OpenAI 兼容的流式请求体。
+func (a *Adapter) streamBody(req *llm.Request) requestBody {
+	model := req.Model
+	if model == "" {
+		model = a.cfg.Model
+	}
+	body := requestBody{Model: model, Messages: wireMessages(req.Messages), Stream: true}
+	for _, t := range req.Tools {
+		var def toolDefinition
+		def.Type = "function"
+		def.Function.Name = t.Name
+		def.Function.Description = t.Description
+		def.Function.Parameters = t.Parameters
+		body.Tools = append(body.Tools, def)
+	}
+	return body
+}
+
+// openStream 发起 HTTP 请求；只有 200 响应才交给 SSE 消费方。
+func (a *Adapter) openStream(ctx context.Context, body requestBody) (*http.Response, error) {
+	raw, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		a.cfg.BaseURL+"/chat/completions", bytes.NewReader(raw))
+	if err != nil {
+		return nil, err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Accept", "text/event-stream")
+	if a.cfg.APIKey != "" {
+		httpReq.Header.Set("Authorization", "Bearer "+a.cfg.APIKey)
+	}
+
+	resp, err := a.client.Do(httpReq)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		defer resp.Body.Close()
+		var msg [4096]byte
+		n, _ := resp.Body.Read(msg[:])
+		return nil, fmt.Errorf("deepseek: HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(msg[:n])))
+	}
+	return resp, nil
+}
+
+// toolCallAccumulator 按工具调用 index 聚合 SSE 增量。
+type toolCallAccumulator struct {
+	pending map[int]*llm.ToolCall
+	args    map[int]*strings.Builder
+}
+
+func newToolCallAccumulator() *toolCallAccumulator {
+	return &toolCallAccumulator{
+		pending: map[int]*llm.ToolCall{},
+		args:    map[int]*strings.Builder{},
+	}
+}
+
+func (a *toolCallAccumulator) add(index int, id, name, args string) {
+	call, ok := a.pending[index]
+	if !ok {
+		call = &llm.ToolCall{}
+		a.pending[index] = call
+		a.args[index] = &strings.Builder{}
+	}
+	if id != "" {
+		call.ID = id
+	}
+	if name != "" {
+		call.Name = name
+	}
+	a.args[index].WriteString(args)
+}
+
+// flush 按 index 顺序产出完整调用，并重置下一组调用的累积状态。
+func (a *toolCallAccumulator) flush(yield func(llm.Chunk) bool) bool {
+	for i := 0; i < len(a.pending); i++ {
+		call := a.pending[i]
+		call.Arguments = a.args[i].String()
+		if !yield(llm.Chunk{ToolCall: call}) {
+			return false
+		}
+	}
+	a.pending = map[int]*llm.ToolCall{}
+	a.args = map[int]*strings.Builder{}
+	return true
+}
+
+// consumeStream 逐行消费 SSE，输出文本、usage 和完整工具调用。
+func consumeStream(ctx context.Context, body io.Reader, yield func(llm.Chunk) bool) {
+	calls := newToolCallAccumulator()
+	scanner := bufio.NewScanner(body)
+	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, ":") {
+			continue
+		}
+		data, ok := strings.CutPrefix(line, "data:")
+		if !ok {
+			continue
+		}
+		data = strings.TrimSpace(data)
+		if data == "[DONE]" {
+			calls.flush(yield)
 			return
 		}
-
-		// 工具调用的增量是分片到达的；按 index 累积，
-		// 待 finish reason 到达时产出完整调用。
-		pending := map[int]*llm.ToolCall{}
-		var argsBuf map[int]*strings.Builder = map[int]*strings.Builder{}
-		flushCalls := func() bool {
-			for i := 0; i < len(pending); i++ {
-				call := pending[i]
-				call.Arguments = argsBuf[i].String()
-				if !yield(llm.Chunk{ToolCall: call}) {
-					return false
-				}
-			}
-			pending = map[int]*llm.ToolCall{}
-			argsBuf = map[int]*strings.Builder{}
-			return true
+		var sr streamResponse
+		if err := json.Unmarshal([]byte(data), &sr); err != nil {
+			yield(llm.Chunk{Err: fmt.Errorf("deepseek: bad SSE data: %w", err)})
+			return
 		}
-
-		scanner := bufio.NewScanner(resp.Body)
-		scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
-		for scanner.Scan() {
-			line := strings.TrimSpace(scanner.Text())
-			if line == "" || strings.HasPrefix(line, ":") {
-				continue
-			}
-			data, ok := strings.CutPrefix(line, "data:")
-			if !ok {
-				continue
-			}
-			data = strings.TrimSpace(data)
-			if data == "[DONE]" {
-				flushCalls()
+		if sr.Usage != nil {
+			if !yield(llm.Chunk{Usage: sr.Usage}) {
 				return
 			}
-			var sr streamResponse
-			if err := json.Unmarshal([]byte(data), &sr); err != nil {
-				yield(llm.Chunk{Err: fmt.Errorf("deepseek: bad SSE data: %w", err)})
-				return
-			}
-			if sr.Usage != nil {
-				if !yield(llm.Chunk{Usage: sr.Usage}) {
+		}
+		for _, choice := range sr.Choices {
+			if choice.Delta.Content != "" {
+				if !yield(llm.Chunk{Delta: choice.Delta.Content}) {
 					return
 				}
 			}
-			for _, choice := range sr.Choices {
-				if choice.Delta.Content != "" {
-					if !yield(llm.Chunk{Delta: choice.Delta.Content}) {
-						return
-					}
-				}
-				for _, tc := range choice.Delta.ToolCalls {
-					call, ok := pending[tc.Index]
-					if !ok {
-						call = &llm.ToolCall{}
-						pending[tc.Index] = call
-						argsBuf[tc.Index] = &strings.Builder{}
-					}
-					if tc.ID != "" {
-						call.ID = tc.ID
-					}
-					if tc.Function.Name != "" {
-						call.Name = tc.Function.Name
-					}
-					argsBuf[tc.Index].WriteString(tc.Function.Arguments)
-				}
-				if choice.FinishReason != "" && len(pending) > 0 {
-					if !flushCalls() {
-						return
-					}
+			for _, tc := range choice.Delta.ToolCalls {
+				calls.add(tc.Index, tc.ID, tc.Function.Name, tc.Function.Arguments)
+			}
+			if choice.FinishReason != "" && len(calls.pending) > 0 {
+				if !calls.flush(yield) {
+					return
 				}
 			}
 		}
-		if err := scanner.Err(); err != nil && ctx.Err() == nil {
-			yield(llm.Chunk{Err: err})
-		}
+	}
+	if err := scanner.Err(); err != nil && ctx.Err() == nil {
+		yield(llm.Chunk{Err: err})
 	}
 }
 

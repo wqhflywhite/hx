@@ -95,7 +95,6 @@ func main() {
 	root := fiber.New()
 	ctx := root.Context()
 	defer root.Dispose()
-
 	configPath, found, err := hxconfig.Find(*configFlag)
 	if err != nil {
 		fatal(err)
@@ -104,47 +103,14 @@ func main() {
 		fatal(fmt.Errorf("--watch needs a config file (use --config or create ./hx.yml)"))
 	}
 
-	// prompter 把审批问题路由进 TUI，webPrompter 路由进 web UI；
-	// 行模式则让审批插件继续使用默认的 stdin
-	// Prompter。
 	prompter := tui.NewPrompter()
 	webPrompter := web.NewPrompter()
-	var stack *hxconfig.Stack
-	agentCtx := ctx
-	if found {
-		f, err := hxconfig.Load(configPath)
-		if err != nil {
-			fatal(err)
-		}
-		var overlays hxconfig.Overlays
-		switch mode {
-		case "tui":
-			overlays = hxconfig.Overlays{"approval": {"prompter": prompter}}
-		case "web":
-			overlays = hxconfig.Overlays{"approval": {"prompter": webPrompter}}
-		}
-		stack, err = hxconfig.MountStack(ctx, f, overlays)
-		if err != nil {
-			fatal(err)
-		}
+	stack, agentCtx, err := mountForMode(ctx, mode, configPath, found, prompter, webPrompter)
+	if err != nil {
+		fatal(err)
+	}
+	if stack != nil {
 		defer stack.Dispose()
-		agentCtx = stack.Layer()
-	} else {
-		// 声明式装配；激活顺序由依赖图决定，与此处顺序无关。
-		for _, name := range flatWire {
-			var cfg map[string]any
-			if name == "approval" {
-				switch mode {
-				case "tui":
-					cfg = map[string]any{"prompter": prompter}
-				case "web":
-					cfg = map[string]any{"prompter": webPrompter}
-				}
-			}
-			if err := plugin.Mount(ctx, name, cfg); err != nil {
-				fatal(err)
-			}
-		}
 	}
 
 	agents, ok := fiber.Get[*agent.Registry](agentCtx, "agents")
@@ -160,27 +126,10 @@ func main() {
 	cell.swap(ag)
 	fmt.Fprintf(os.Stderr, "session: %s\n", cell.sessionID())
 
-	// notify 用于上报配置热重挂的结果；TUI 和 web 模式运行后
-	// 会把它改接到各自的 UI。
+	// TUI 和 web 启动后会把 notify 改接到各自的 UI。
 	notify := func(text string) { fmt.Fprintf(os.Stderr, "hx: %s\n", text) }
 	if found && *watch {
-		if err := stack.Watch(configPath, func(err error) {
-			if err != nil {
-				notify("config reload failed: " + err.Error())
-				return
-			}
-			// 插件层已重建；在同一份会话日志上重启 agent。
-			reg, ok := fiber.Get[*agent.Registry](stack.Layer(), "agents")
-			if !ok {
-				return
-			}
-			fresh, err := reg.Create(stack.Layer(), agent.Options{SessionID: cell.sessionID()})
-			if err != nil {
-				return
-			}
-			cell.swap(fresh)
-			notify("config reloaded; agent restarted on session " + cell.sessionID())
-		}); err != nil {
+		if err := watchConfig(stack, configPath, cell, notify); err != nil {
 			fatal(err)
 		}
 	}
@@ -204,6 +153,65 @@ func main() {
 	default:
 		oneshot(ctx, cell, rest[0])
 	}
+}
+
+// mountForMode 按界面模式挂载 flat 默认组合或配置驱动的双层 Stack。
+func mountForMode(ctx *fiber.Context, mode, configPath string, found bool, prompter *tui.Prompter, webPrompter *web.Prompter) (*hxconfig.Stack, *fiber.Context, error) {
+	if found {
+		f, err := hxconfig.Load(configPath)
+		if err != nil {
+			return nil, nil, err
+		}
+		var overlays hxconfig.Overlays
+		switch mode {
+		case "tui":
+			overlays = hxconfig.Overlays{"approval": {"prompter": prompter}}
+		case "web":
+			overlays = hxconfig.Overlays{"approval": {"prompter": webPrompter}}
+		}
+		stack, err := hxconfig.MountStack(ctx, f, overlays)
+		if err != nil {
+			return nil, nil, err
+		}
+		return stack, stack.Layer(), nil
+	}
+
+	// 声明式装配；激活顺序由依赖图决定，与 flatWire 顺序无关。
+	for _, name := range flatWire {
+		var cfg map[string]any
+		if name == "approval" {
+			switch mode {
+			case "tui":
+				cfg = map[string]any{"prompter": prompter}
+			case "web":
+				cfg = map[string]any{"prompter": webPrompter}
+			}
+		}
+		if err := plugin.Mount(ctx, name, cfg); err != nil {
+			return nil, nil, err
+		}
+	}
+	return nil, ctx, nil
+}
+
+// watchConfig 在插件层重建后，用同一会话 id 替换当前 agent。
+func watchConfig(stack *hxconfig.Stack, configPath string, cell *agentCell, notify func(string)) error {
+	return stack.Watch(configPath, func(err error) {
+		if err != nil {
+			notify("config reload failed: " + err.Error())
+			return
+		}
+		reg, ok := fiber.Get[*agent.Registry](stack.Layer(), "agents")
+		if !ok {
+			return
+		}
+		fresh, err := reg.Create(stack.Layer(), agent.Options{SessionID: cell.sessionID()})
+		if err != nil {
+			return
+		}
+		cell.swap(fresh)
+		notify("config reloaded; agent restarted on session " + cell.sessionID())
+	})
 }
 
 // newWebServer 把 web 服务器接入 harness：消息发往 cell，

@@ -261,7 +261,28 @@ func candidateK(limit int) int {
 // 文本为空但带查询向量时是纯向量搜索；两者都没有时 Search
 // 不返回任何结果。
 func (x *Index) Search(ctx context.Context, query string, opts SearchOpts) ([]Hit, error) {
-	ftsW, vecW := 0.0, 0.0
+	ftsW, vecW, limit := searchWeights(opts)
+	k := candidateK(limit)
+	merged := blendedHits{}
+	if ftsW > 0 {
+		cands, err := x.ftsCandidates(ctx, query, k)
+		if err != nil {
+			return nil, err
+		}
+		merged.add(cands, ftsW)
+	}
+	if vecW > 0 {
+		cands, err := x.vectorCandidates(ctx, opts.Vector, k)
+		if err != nil {
+			return nil, err
+		}
+		merged.add(cands, vecW)
+	}
+	return merged.top(limit), nil
+}
+
+// searchWeights 解析检索权重与返回条数；缺省为纯 FTS。
+func searchWeights(opts SearchOpts) (ftsW, vecW float64, limit int) {
 	if opts.FTSWeight != nil {
 		ftsW = *opts.FTSWeight
 	}
@@ -274,49 +295,39 @@ func (x *Index) Search(ctx context.Context, query string, opts SearchOpts) ([]Hi
 	if len(opts.Vector) == 0 {
 		vecW = 0
 	}
-	limit := opts.Limit
+	limit = opts.Limit
 	if limit <= 0 {
 		limit = 10
 	}
-	k := candidateK(limit)
+	return ftsW, vecW, limit
+}
 
-	type blendKey struct {
-		path string
-		idx  int
-	}
-	merged := map[blendKey]*Hit{}
-	if ftsW > 0 {
-		cands, err := x.ftsCandidates(ctx, query, k)
-		if err != nil {
-			return nil, err
-		}
-		minMaxNormalize(cands)
-		for _, c := range cands {
-			h := c.hit
-			h.Score = ftsW * c.score
-			merged[blendKey{h.Path, h.Idx}] = &h
-		}
-	}
-	if vecW > 0 {
-		cands, err := x.vectorCandidates(ctx, opts.Vector, k)
-		if err != nil {
-			return nil, err
-		}
-		minMaxNormalize(cands)
-		for _, c := range cands {
-			key := blendKey{c.hit.Path, c.hit.Idx}
-			if h, ok := merged[key]; ok {
-				h.Score += vecW * c.score
-			} else {
-				h := c.hit
-				h.Score = vecW * c.score
-				merged[key] = &h
-			}
-		}
-	}
+type blendKey struct {
+	path string
+	idx  int
+}
 
+type blendedHits map[blendKey]*Hit
+
+// add 先归一化单侧候选，再按权重加入混合分数。
+func (m blendedHits) add(cands []candidate, weight float64) {
+	minMaxNormalize(cands)
+	for _, c := range cands {
+		key := blendKey{path: c.hit.Path, idx: c.hit.Idx}
+		if h, ok := m[key]; ok {
+			h.Score += weight * c.score
+			continue
+		}
+		h := c.hit
+		h.Score = weight * c.score
+		m[key] = &h
+	}
+}
+
+// top 按分数、路径和 chunk 序索引确定性排序并截断。
+func (m blendedHits) top(limit int) []Hit {
 	var hits []Hit
-	for _, h := range merged {
+	for _, h := range m {
 		hits = append(hits, *h)
 	}
 	sort.Slice(hits, func(i, j int) bool {
@@ -331,7 +342,7 @@ func (x *Index) Search(ctx context.Context, query string, opts SearchOpts) ([]Hi
 	if len(hits) > limit {
 		hits = hits[:limit]
 	}
-	return hits, nil
+	return hits
 }
 
 // ftsCandidates 返回 query 的 k 个最佳 FTS 匹配，分数是原始

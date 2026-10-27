@@ -100,44 +100,53 @@ func render(sources []source, maxBytes int) string {
 	if len(sources) == 0 {
 		return ""
 	}
-	frame := func(marker string, srcs []source) string {
-		blocks := []string{}
-		if marker != "" {
-			blocks = append(blocks, marker)
-		}
-		blocks = append(blocks, intro)
-		for _, s := range srcs {
-			blocks = append(blocks, "Memory from: "+s.path+"\n\n"+escape(s.content))
-		}
-		return frameOpen + "\n" + strings.Join(blocks, "\n\n") + "\n" + frameClose
-	}
-	if msg := frame("", sources); len(msg) <= maxBytes {
+	if msg := memoryFrame("", sources); len(msg) <= maxBytes {
 		return msg
 	}
-
 	specific := sources[len(sources)-1]
 	omitted := sources[:len(sources)-1]
-	marker := func(included int) string {
-		var parts []string
-		if len(omitted) > 0 {
-			paths := make([]string, 0, len(omitted))
-			for _, s := range omitted {
-				paths = append(paths, s.path)
-			}
-			parts = append(parts, "omitted "+strings.Join(paths, ", "))
-		}
-		if included < len(specific.content) {
-			parts = append(parts, fmt.Sprintf("truncated %s from %d to %d bytes", specific.path, len(specific.content), included))
-		}
-		return fmt.Sprintf("Memory budget %d bytes: %s", maxBytes, strings.Join(parts, "; "))
-	}
+	return fitSpecificSource(specific, omitted, maxBytes)
+}
 
+// memoryFrame 拼装预算标注、说明与各来源内容。
+func memoryFrame(marker string, sources []source) string {
+	blocks := []string{}
+	if marker != "" {
+		blocks = append(blocks, marker)
+	}
+	blocks = append(blocks, intro)
+	for _, s := range sources {
+		blocks = append(blocks, "Memory from: "+s.path+"\n\n"+escape(s.content))
+	}
+	return frameOpen + "\n" + strings.Join(blocks, "\n\n") + "\n" + frameClose
+}
+
+// memoryBudgetMarker 说明被省略的来源与最具体来源的截断量。
+func memoryBudgetMarker(specific source, omitted []source, included, maxBytes int) string {
+	var parts []string
+	if len(omitted) > 0 {
+		paths := make([]string, 0, len(omitted))
+		for _, s := range omitted {
+			paths = append(paths, s.path)
+		}
+		parts = append(parts, "omitted "+strings.Join(paths, ", "))
+	}
+	if included < len(specific.content) {
+		parts = append(parts, fmt.Sprintf("truncated %s from %d to %d bytes", specific.path, len(specific.content), included))
+	}
+	return fmt.Sprintf("Memory budget %d bytes: %s", maxBytes, strings.Join(parts, "; "))
+}
+
+// fitSpecificSource 省略宽泛来源，并二分寻找最具体来源的最大可
+// 保留前缀；预算连空内容都放不下时退化为直接截断框架。
+func fitSpecificSource(specific source, omitted []source, maxBytes int) string {
 	best := ""
 	lo, hi := 0, len(specific.content)
 	for lo <= hi {
 		mid := (lo + hi) / 2
 		cut := truncateUTF8(specific.content, mid)
-		msg := frame(marker(len(cut)), []source{{path: specific.path, content: cut}})
+		marker := memoryBudgetMarker(specific, omitted, len(cut), maxBytes)
+		msg := memoryFrame(marker, []source{{path: specific.path, content: cut}})
 		if len(msg) <= maxBytes {
 			best = msg
 			lo = mid + 1
@@ -148,8 +157,7 @@ func render(sources []source, maxBytes int) string {
 	if best != "" {
 		return best
 	}
-	// 退化预算：连只带空小节的标记都放不下。
-	return truncateUTF8(frame(marker(0), nil), maxBytes)
+	return truncateUTF8(memoryFrame(memoryBudgetMarker(specific, omitted, 0, maxBytes), nil), maxBytes)
 }
 
 // injectState 是每个会话记录最近一次注入的状态。
