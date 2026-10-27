@@ -50,11 +50,19 @@ type compactCall struct {
 	err      error
 }
 
-func newCompactCall() *compactCall {
-	finished := make(chan struct{})
-	return &compactCall{
-		finished: finished,
-	}
+// previousSummary 是最近一次摘要留下的覆盖边界与滚动蒸馏前情。
+type previousSummary struct {
+	index      int
+	content    string
+	firstKept  int
+	throughSeq int
+}
+
+// summaryInput 是摘要模型输入及其覆盖元数据。
+type summaryInput struct {
+	transcript string
+	firstKept  int
+	throughSeq int
 }
 
 // basic 是基础 provider：超预算后先做无模型调用的剪枝（prune），
@@ -70,12 +78,12 @@ type basic struct {
 	calls      map[string]*compactCall
 }
 
-// MaybeCompact 实现 Compactor 接口。
+// MaybeCompact 实现 Compactor 接口。同会话并发调用共享一次实际
+// 压缩；锁只保护调用表与结果发布，不跨日志或模型调用。
 func (b *basic) MaybeCompact(c *fiber.Context, ctx context.Context, store session.Store, sessionID string) (done bool, err error) {
 	b.mu.Lock()
 	if call, ok := b.calls[sessionID]; ok {
 		b.mu.Unlock()
-
 		select {
 		case <-call.finished:
 			return call.done, call.err
@@ -85,25 +93,27 @@ func (b *basic) MaybeCompact(c *fiber.Context, ctx context.Context, store sessio
 			return false, fiber.ErrDisposed
 		}
 	}
-
 	if b.calls == nil {
 		b.calls = make(map[string]*compactCall)
 	}
-	call := newCompactCall()
+	call := &compactCall{finished: make(chan struct{})}
 	b.calls[sessionID] = call
-
 	defer func() {
 		b.mu.Lock()
-
+		defer b.mu.Unlock()
 		call.done = done
 		call.err = err
 		delete(b.calls, sessionID)
 		close(call.finished)
-
-		b.mu.Unlock()
 	}()
-
 	b.mu.Unlock()
+
+	return b.compact(c, ctx, store, sessionID)
+}
+
+// compact 编排一次实际压缩：预算判断、剪枝、摘要输入、模型调用与
+// summary 落日志。
+func (b *basic) compact(c *fiber.Context, ctx context.Context, store session.Store, sessionID string) (bool, error) {
 	events, err := store.Events(sessionID)
 	if err != nil {
 		return false, err
@@ -112,28 +122,57 @@ func (b *basic) MaybeCompact(c *fiber.Context, ctx context.Context, store sessio
 		return false, nil
 	}
 
-	// 最新一条 summary 提供覆盖水位线：候选从 ThroughSeq+1 开始，
-	// 其载荷同时是滚动蒸馏的前情与 keep_first 的既有口径。
-	lastSummary := -1
-	prevSummary := ""
-	prevFirstKept := 0
-	prevThroughSeq := -1
-	for i, ev := range events {
-		if ev.Type == session.Summary {
-			lastSummary = i
-			var d session.SummaryData
-			if json.Unmarshal(ev.Data, &d) == nil {
-				prevSummary = d.Content
-				prevFirstKept = d.FirstKept
-				prevThroughSeq = d.ThroughSeq
-			}
-		}
+	prev := readPreviousSummary(events)
+	events, pruned, err := b.pruneResults(c, store, events, prev.index)
+	if err != nil {
+		return false, err
+	}
+	if pruned && estimateTokens(session.DeriveMessages(events)) <= b.maxTokens {
+		return true, nil
 	}
 
-	// 第一步是剪枝：无模型调用，水位线之后投影内容超长的
-	// tool/result 事件被改写为头尾摘录。剪枝改变模型可见内容，
-	// 因此按「模型可见 ⟺ 已落日志」以 session/prune 事件落日志
-	// 再广播（store 两件事都做）。
+	input, ok := b.summaryWindow(events, prev)
+	if !ok {
+		return pruned, nil
+	}
+	summary, err := b.summarize(c, ctx, input.transcript)
+	if err != nil {
+		return false, err
+	}
+
+	// 摘要对模型可见，因此它像其他模型输入一样走会话日志：先写入、再
+	// 广播。水位线之前的事件退出投影，其 prune 回改也随之自然失效。
+	data := session.MarshalData(session.SummaryData{
+		Content: summary, FirstKept: input.firstKept, ThroughSeq: input.throughSeq,
+	})
+	if err := store.Append(c, session.Event{Type: session.Summary, Data: data}); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// readPreviousSummary 找最新一条 summary；无效载荷只更新物理位置，
+// 不推进覆盖水位线，与 DeriveMessages 的扫描语义一致。
+func readPreviousSummary(events []session.Event) previousSummary {
+	prev := previousSummary{index: -1, throughSeq: -1}
+	for i, ev := range events {
+		if ev.Type != session.Summary {
+			continue
+		}
+		prev.index = i
+		var d session.SummaryData
+		if json.Unmarshal(ev.Data, &d) == nil {
+			prev.content = d.Content
+			prev.firstKept = d.FirstKept
+			prev.throughSeq = d.ThroughSeq
+		}
+	}
+	return prev
+}
+
+// pruneResults 剪枝上一物理 summary 后的超长工具结果。每次剪枝先
+// 追加 prune 事件，再更新本次估算使用的事件快照。
+func (b *basic) pruneResults(c *fiber.Context, store session.Store, events []session.Event, lastSummary int) ([]session.Event, bool, error) {
 	pruned := false
 	for i := lastSummary + 1; i < len(events); i++ {
 		ev := events[i]
@@ -153,92 +192,79 @@ func (b *basic) MaybeCompact(c *fiber.Context, ctx context.Context, store sessio
 		}
 		pruneEv := session.Event{Type: session.Prune, Data: session.MarshalData(session.PruneData{Seq: i, Content: pruneText(content)})}
 		if err := store.Append(c, pruneEv); err != nil {
-			return false, err
+			return events, pruned, err
 		}
 		events = append(events, pruneEv)
 		pruned = true
 	}
-	// 剪枝后重新估算：回到预算内就跳过 LLM 摘要。
-	if pruned && estimateTokens(session.DeriveMessages(events)) <= b.maxTokens {
-		return true, nil
-	}
+	return events, pruned, nil
+}
 
-	// 尾部 keepRecent 条事件保持不动。
-
-	head := events[prevThroughSeq+1:]
+// summaryWindow 选择本次真正覆盖的原始事件，保留 keepFirst 头部与
+// keepRecent 尾部，并构造滚动蒸馏 transcript。它是纯计算，不写日志。
+func (b *basic) summaryWindow(events []session.Event, prev previousSummary) (summaryInput, bool) {
+	head := events[prev.throughSeq+1:]
 	if len(head) <= b.keepRecent {
-		return pruned, nil
+		return summaryInput{}, false
 	}
 	cut := len(head) - b.keepRecent
-	// 绝不把一次工具调用与其结果拆散在摘要边界两侧。
 	for cut < len(head) && (head[cut].Type == session.ToolCall || head[cut].Type == session.ToolResult) {
 		cut++
 	}
 
-	// keep_first：首次压缩钉住日志开头的 keepFirst 条事件（初始
-	// 目标），之后的压缩继承前一条 summary 的口径——日志前缀
-	// 不可变，两者必然一致。
-	keepFirst := prevFirstKept
+	keepFirst := prev.firstKept
 	start := 0
-	if lastSummary < 0 {
+	if prev.index < 0 {
 		keepFirst = min(b.keepFirst, len(head))
-		// 头部边界与尾部同一条规则：绝不落在一次工具调用与其
-		// 结果之间，钉住的前缀不会只剩配对的一半。
 		for keepFirst < len(head) && (head[keepFirst].Type == session.ToolCall || head[keepFirst].Type == session.ToolResult) {
 			keepFirst++
 		}
 		start = keepFirst
 	}
 	if start >= cut {
-		return pruned, nil
+		return summaryInput{}, false
 	}
-	toSummarize := head[start:cut]
 
-	// 滚动蒸馏：旧摘要不被丢弃，作为前情与新原始事件一起进入
-	// transcript，压缩 N 次后早期目标仍留在摘要链里。
 	var transcript strings.Builder
-	if prevSummary != "" {
+	if prev.content != "" {
 		transcript.WriteString("Summary of earlier events:\n")
-		transcript.WriteString(prevSummary)
+		transcript.WriteString(prev.content)
 		transcript.WriteString("\n\nEvents not covered by that summary:\n")
 	}
-	throughSeq := prevThroughSeq
-	for i, ev := range toSummarize {
+	throughSeq := prev.throughSeq
+	for i, ev := range head[start:cut] {
 		if ev.Type != session.Summary && ev.Type != session.Prune {
-			throughSeq = prevThroughSeq + 1 + start + i
+			throughSeq = prev.throughSeq + 1 + start + i
 		}
 		transcript.WriteString(renderEvent(ev))
 	}
-	if throughSeq == prevThroughSeq {
-		return pruned, nil
+	if throughSeq == prev.throughSeq {
+		return summaryInput{}, false
 	}
+	return summaryInput{transcript: transcript.String(), firstKept: keepFirst, throughSeq: throughSeq}, true
+}
+
+// summarize 调用模型并收集完整摘要文本。
+func (b *basic) summarize(c *fiber.Context, ctx context.Context, transcript string) (string, error) {
 	req := &llm.Request{Messages: []llm.Message{
 		{Role: "system", Content: b.prompt},
-		{Role: "user", Content: transcript.String()},
+		{Role: "user", Content: transcript},
 	}}
 	stream, err := llm.Stream(c, ctx, req)
 	if err != nil {
-		return false, fmt.Errorf("compaction: summarize: %w", err)
+		return "", fmt.Errorf("compaction: summarize: %w", err)
 	}
 	var summary []byte
 	for chunk := range stream {
 		if chunk.Err != nil {
-			return false, fmt.Errorf("compaction: summarize: %w", chunk.Err)
+			return "", fmt.Errorf("compaction: summarize: %w", chunk.Err)
 		}
 		summary = append(summary, chunk.Delta...)
 	}
 	if len(summary) == 0 {
-		return false, fmt.Errorf("compaction: empty summary")
+		return "", fmt.Errorf("compaction: empty summary")
 	}
-
-	// 摘要对模型可见，因此它像其他模型输入一样走会话日志：先写入、再
-	// 广播（store 两件事都做）。summary 领投后，其覆盖区间的 prune
-	// 自然失效——水位线之前的事件不再投影，prune 的回改随之落空。
-	data := session.MarshalData(session.SummaryData{Content: string(summary), FirstKept: keepFirst, ThroughSeq: throughSeq})
-	if err := store.Append(c, session.Event{Type: session.Summary, Data: data}); err != nil {
-		return false, err
-	}
-	return true, nil
+	return string(summary), nil
 }
 
 // pruneText 把超长内容改写为头 4096 字节加省略标注加尾 1024 字节。
