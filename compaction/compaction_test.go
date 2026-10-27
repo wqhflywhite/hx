@@ -3,11 +3,13 @@ package compaction_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"iter"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -27,18 +29,23 @@ import (
 )
 
 // fakeAdapter 对每个请求都回复同一段固定内容，并记录收到的请求。
-// started/release 可让并发追加测试把摘要调用停在模型响应之前。
+// started/release 可让并发测试把摘要调用停在模型响应之前；并发请求
+// 共享 started 时只关闭一次，请求记录由 mu 保护。
 type fakeAdapter struct {
-	response string
-	reqs     []*llm.Request
-	started  chan struct{}
-	release  chan struct{}
+	mu        sync.Mutex
+	startOnce sync.Once
+	response  string
+	reqs      []*llm.Request
+	started   chan struct{}
+	release   chan struct{}
 }
 
 func (f *fakeAdapter) Stream(_ context.Context, req *llm.Request) iter.Seq[llm.Chunk] {
+	f.mu.Lock()
 	f.reqs = append(f.reqs, req)
+	f.mu.Unlock()
 	if f.started != nil {
-		close(f.started)
+		f.startOnce.Do(func() { close(f.started) })
 	}
 	if f.release != nil {
 		<-f.release
@@ -243,6 +250,87 @@ func TestCompactionKeepsEventsAppendedDuringSummary(t *testing.T) {
 	fullRaw, _ := json.Marshal(session.DeriveMessages(events))
 	if string(fullRaw) != string(wantRaw) {
 		t.Fatalf("DeriveMessages = %s; want %s", fullRaw, wantRaw)
+	}
+}
+
+// TestConcurrentCompactionWaiterCancellation 覆盖同会话 singleflight：
+// 等待中的调用必须响应自己的取消，且不能与首个调用重复请求摘要模型。
+func TestConcurrentCompactionWaiterCancellation(t *testing.T) {
+	ctx, compactor, mgr, adapter := newCompactor(t, map[string]any{"max_context_tokens": 1, "keep_recent_events": 1, "keep_first_events": 0})
+	store, id, err := mgr.Create()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.(interface{ Close() error }).Close()
+	appendAll(t, ctx, store, []session.Event{
+		{Type: session.UserMessage, Data: session.MarshalData(session.UserMessageData{Content: "old question"})},
+		{Type: session.AssistantMessage, Data: session.MarshalData(session.AssistantMessageData{Content: "old answer"})},
+		{Type: session.UserMessage, Data: session.MarshalData(session.UserMessageData{Content: "kept recent"})},
+	})
+	adapter.started = make(chan struct{})
+	adapter.release = make(chan struct{})
+	released := false
+	defer func() {
+		if !released {
+			close(adapter.release)
+		}
+	}()
+	type result struct {
+		done bool
+		err  error
+	}
+	leaderResult := make(chan result, 1)
+	go func() {
+		done, err := compactor.MaybeCompact(ctx, context.Background(), store, id)
+		leaderResult <- result{done: done, err: err}
+	}()
+	select {
+	case <-adapter.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("leading summarizer did not start")
+	}
+
+	followerCtx, cancelFollower := context.WithCancel(context.Background())
+	followerResult := make(chan result, 1)
+	go func() {
+		done, err := compactor.MaybeCompact(ctx, followerCtx, store, id)
+		followerResult <- result{done: done, err: err}
+	}()
+	cancelFollower()
+	select {
+	case got := <-followerResult:
+		if got.done || !errors.Is(got.err, context.Canceled) {
+			t.Fatalf("follower: done=%v err=%v; want context.Canceled", got.done, got.err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("concurrent waiter ignored cancellation or called the summarizer again")
+	}
+
+	close(adapter.release)
+	released = true
+	select {
+	case got := <-leaderResult:
+		if got.err != nil || !got.done {
+			t.Fatalf("leader: done=%v err=%v", got.done, got.err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("leading compaction did not finish")
+	}
+	if len(adapter.reqs) != 1 {
+		t.Fatalf("summarizer saw %d requests; want 1", len(adapter.reqs))
+	}
+	events, err := mgr.Events(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	summaries := 0
+	for _, ev := range events {
+		if ev.Type == session.Summary {
+			summaries++
+		}
+	}
+	if summaries != 1 {
+		t.Fatalf("log has %d summaries; want 1", summaries)
 	}
 }
 

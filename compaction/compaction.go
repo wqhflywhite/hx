@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
 
 	"hx/core/fiber"
 	"hx/core/plugin"
@@ -43,6 +44,19 @@ type Compactor interface {
 	MaybeCompact(c *fiber.Context, ctx context.Context, store session.Store, sessionID string) (bool, error)
 }
 
+type compactCall struct {
+	finished chan struct{}
+	done     bool
+	err      error
+}
+
+func newCompactCall() *compactCall {
+	finished := make(chan struct{})
+	return &compactCall{
+		finished: finished,
+	}
+}
+
 // basic 是基础 provider：超预算后先做无模型调用的剪枝（prune），
 // 仍超才把中间区段交给 LLM 摘要成转录文本，再以 summary 事件追加
 // 回日志。
@@ -52,10 +66,44 @@ type basic struct {
 	keepFirst  int
 	pruneBytes int
 	prompt     string
+	mu         sync.Mutex
+	calls      map[string]*compactCall
 }
 
 // MaybeCompact 实现 Compactor 接口。
-func (b *basic) MaybeCompact(c *fiber.Context, ctx context.Context, store session.Store, sessionID string) (bool, error) {
+func (b *basic) MaybeCompact(c *fiber.Context, ctx context.Context, store session.Store, sessionID string) (done bool, err error) {
+	b.mu.Lock()
+	if call, ok := b.calls[sessionID]; ok {
+		b.mu.Unlock()
+
+		select {
+		case <-call.finished:
+			return call.done, call.err
+		case <-ctx.Done():
+			return false, ctx.Err()
+		case <-c.Fiber().Done():
+			return false, fiber.ErrDisposed
+		}
+	}
+
+	if b.calls == nil {
+		b.calls = make(map[string]*compactCall)
+	}
+	call := newCompactCall()
+	b.calls[sessionID] = call
+
+	defer func() {
+		b.mu.Lock()
+
+		call.done = done
+		call.err = err
+		delete(b.calls, sessionID)
+		close(call.finished)
+
+		b.mu.Unlock()
+	}()
+
+	b.mu.Unlock()
 	events, err := store.Events(sessionID)
 	if err != nil {
 		return false, err
