@@ -1,6 +1,7 @@
 package approval_test
 
 import (
+	"context"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -21,7 +22,7 @@ func (t fakeTool) Name() string { return "fake_tool" }
 func (t fakeTool) Schema() map[string]any {
 	return map[string]any{"description": "test double", "type": "object"}
 }
-func (t fakeTool) Execute(_ *fiber.Context, _ json.RawMessage) (any, error) {
+func (t fakeTool) Execute(_ context.Context, _ *fiber.Context, _ json.RawMessage) (any, error) {
 	*t.ran++
 	return "fake-output", nil
 }
@@ -32,7 +33,7 @@ type fakePrompter struct {
 	asked   []string
 }
 
-func (p *fakePrompter) Confirm(_ *fiber.Context, call llm.ToolCall) (bool, error) {
+func (p *fakePrompter) Confirm(_ context.Context, _ *fiber.Context, call llm.ToolCall) (bool, error) {
 	p.asked = append(p.asked, call.Name)
 	return p.approve, nil
 }
@@ -67,7 +68,7 @@ func TestRejectShortCircuits(t *testing.T) {
 	defer cleanup()
 	defer reg.Register(fakeTool{ran: &ran})()
 
-	res := reg.Execute(c, llm.ToolCall{ID: "call_1", Name: "fake_tool", Arguments: "{}"})
+	res := reg.Execute(context.Background(), c, llm.ToolCall{ID: "call_1", Name: "fake_tool", Arguments: "{}"})
 	if ran != 0 {
 		t.Fatal("rejected call must not execute the tool")
 	}
@@ -86,7 +87,7 @@ func TestApproveExecutes(t *testing.T) {
 	defer cleanup()
 	defer reg.Register(fakeTool{ran: &ran})()
 
-	res := reg.Execute(c, llm.ToolCall{ID: "call_1", Name: "fake_tool", Arguments: "{}"})
+	res := reg.Execute(context.Background(), c, llm.ToolCall{ID: "call_1", Name: "fake_tool", Arguments: "{}"})
 	if ran != 1 {
 		t.Fatalf("approved call ran %d times; want 1", ran)
 	}
@@ -107,7 +108,7 @@ func TestModes(t *testing.T) {
 	defer reg.Register(fakeTool{ran: &ran})()
 
 	// "auto" 模式完全跳过询问。
-	res := reg.Execute(c, llm.ToolCall{ID: "call_1", Name: "fake_tool", Arguments: "{}"})
+	res := reg.Execute(context.Background(), c, llm.ToolCall{ID: "call_1", Name: "fake_tool", Arguments: "{}"})
 	if ran != 1 || res.Error != "" {
 		t.Fatalf("auto mode must execute without asking: %+v", res)
 	}
@@ -116,7 +117,7 @@ func TestModes(t *testing.T) {
 	}
 
 	// 未列出的工具回退到默认的 "ask"。
-	res = reg.Execute(c, llm.ToolCall{ID: "call_2", Name: "bash", Arguments: "{}"})
+	res = reg.Execute(context.Background(), c, llm.ToolCall{ID: "call_2", Name: "bash", Arguments: "{}"})
 	if !strings.Contains(res.Error, "denied") || len(prompter.asked) != 1 {
 		t.Fatalf("ask mode must prompt and reject: %+v asked=%v", res, prompter.asked)
 	}
@@ -132,11 +133,11 @@ func TestBadModeFailsLoud(t *testing.T) {
 
 func TestStdinPrompter(t *testing.T) {
 	p := approval.StdinPrompter(strings.NewReader("y\n\n"), &strings.Builder{})
-	ok, err := p.Confirm(nil, llm.ToolCall{Name: "bash"})
+	ok, err := p.Confirm(context.Background(), nil, llm.ToolCall{Name: "bash"})
 	if err != nil || !ok {
 		t.Fatalf("y must approve: ok=%v err=%v", ok, err)
 	}
-	ok, err = p.Confirm(nil, llm.ToolCall{Name: "bash"})
+	ok, err = p.Confirm(context.Background(), nil, llm.ToolCall{Name: "bash"})
 	if err != nil || ok {
 		t.Fatalf("empty answer must deny: ok=%v err=%v", ok, err)
 	}

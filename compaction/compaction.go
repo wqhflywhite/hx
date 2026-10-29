@@ -125,7 +125,7 @@ func (b *basic) compact(c *fiber.Context, ctx context.Context, store session.Sto
 	prev := readPreviousSummary(events)
 	events, pruned, err := b.pruneResults(c, store, events, prev.index)
 	if err != nil {
-		return false, err
+		return pruned, err
 	}
 	if pruned && estimateTokens(session.DeriveMessages(events)) <= b.maxTokens {
 		return true, nil
@@ -137,7 +137,7 @@ func (b *basic) compact(c *fiber.Context, ctx context.Context, store session.Sto
 	}
 	summary, err := b.summarize(c, ctx, input.transcript)
 	if err != nil {
-		return false, err
+		return pruned, err
 	}
 
 	// 摘要对模型可见，因此它像其他模型输入一样走会话日志：先写入、再
@@ -146,7 +146,7 @@ func (b *basic) compact(c *fiber.Context, ctx context.Context, store session.Sto
 		Content: summary, FirstKept: input.firstKept, ThroughSeq: input.throughSeq,
 	})
 	if err := store.Append(c, session.Event{Type: session.Summary, Data: data}); err != nil {
-		return false, err
+		return pruned, err
 	}
 	return true, nil
 }
@@ -170,9 +170,20 @@ func readPreviousSummary(events []session.Event) previousSummary {
 	return prev
 }
 
-// pruneResults 剪枝上一物理 summary 后的超长工具结果。每次剪枝先
-// 追加 prune 事件，再更新本次估算使用的事件快照。
+// pruneResults 根据当前有效投影剪枝上一物理 summary 后的超长工具
+// 结果。已有 prune 会先应用到估算快照，因此重试不会重复追加；
+// 只有新摘录确实更短时才写入事件。
 func (b *basic) pruneResults(c *fiber.Context, store session.Store, events []session.Event, lastSummary int) ([]session.Event, bool, error) {
+	effective := make(map[int]string)
+	for _, ev := range events {
+		if ev.Type != session.Prune {
+			continue
+		}
+		var d session.PruneData
+		if json.Unmarshal(ev.Data, &d) == nil {
+			effective[d.Seq] = d.Content
+		}
+	}
 	pruned := false
 	for i := lastSummary + 1; i < len(events); i++ {
 		ev := events[i]
@@ -187,14 +198,19 @@ func (b *basic) pruneResults(c *fiber.Context, store session.Store, events []ses
 		if d.Error != "" {
 			content = d.Error
 		}
-		if len(content) <= b.pruneBytes {
+		if _, ok := effective[i]; ok {
 			continue
 		}
-		pruneEv := session.Event{Type: session.Prune, Data: session.MarshalData(session.PruneData{Seq: i, Content: pruneText(content)})}
+		replacement := pruneText(content, b.pruneBytes)
+		if replacement == content {
+			continue
+		}
+		pruneEv := session.Event{Type: session.Prune, Data: session.MarshalData(session.PruneData{Seq: i, Content: replacement})}
 		if err := store.Append(c, pruneEv); err != nil {
 			return events, pruned, err
 		}
 		events = append(events, pruneEv)
+		effective[i] = replacement
 		pruned = true
 	}
 	return events, pruned, nil
@@ -267,13 +283,22 @@ func (b *basic) summarize(c *fiber.Context, ctx context.Context, transcript stri
 	return string(summary), nil
 }
 
-// pruneText 把超长内容改写为头 4096 字节加省略标注加尾 1024 字节。
-func pruneText(s string) string {
-	const head, tail = 4096, 1024
-	if len(s) <= head+tail {
+// pruneText 在 limit 内分配头尾摘录长度；小预算也允许省略标注
+// 占主要部分，但摘录不短于原文时返回原文，由调用方跳过无效 prune。
+func pruneText(s string, limit int) string {
+	if limit <= 0 || len(s) <= limit {
 		return s
 	}
-	return fmt.Sprintf("%s\n... [%d bytes pruned] ...\n%s", s[:head], len(s)-head-tail, s[len(s)-tail:])
+	head := min(4096, limit/2)
+	tail := min(1024, limit-head)
+	if head+tail >= len(s) {
+		return s
+	}
+	out := fmt.Sprintf("%s\n... [%d bytes pruned] ...\n%s", s[:head], len(s)-head-tail, s[len(s)-tail:])
+	if len(out) >= len(s) {
+		return s
+	}
+	return out
 }
 
 // estimateTokens 近似估算投影消息的 token 开销；字符/token 比例只是
@@ -309,7 +334,11 @@ func renderEvent(ev session.Event) string {
 	case session.ToolResult:
 		var d session.ToolResultData
 		if json.Unmarshal(ev.Data, &d) == nil {
-			return fmt.Sprintf("Tool %s returned: %s\n", d.Name, truncate(d.Content, 300))
+			content := d.Content
+			if d.Error != "" {
+				content = d.Error
+			}
+			return fmt.Sprintf("Tool %s returned: %s\n", d.Name, truncate(content, 300))
 		}
 	}
 	return ""

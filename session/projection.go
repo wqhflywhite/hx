@@ -163,6 +163,12 @@ func (p *projection) view() []llm.Message {
 // 任意调用）冷读一次日志，之后的调用只折叠自上次调用以来追加
 // 的事件。
 func (m *Manager) Messages(id string) ([]llm.Message, error) {
+	if _, err := m.path(id); err != nil {
+		return nil, err
+	}
+	state := m.appendState(id)
+	state.Lock()
+	defer state.Unlock()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	p, err := m.projection(id)
@@ -177,7 +183,7 @@ func (m *Manager) Messages(id string) ([]llm.Message, error) {
 }
 
 // projection 返回 id 的缓存投影，首次见到时从磁盘冷载日志。
-// 调用方需持有 m.mu。
+// 调用方需依次持有会话 state 与 m.mu。
 func (m *Manager) projection(id string) (*projection, error) {
 	if p, ok := m.projs[id]; ok {
 		return p, nil
@@ -195,19 +201,16 @@ func (m *Manager) projection(id string) (*projection, error) {
 	return pro, nil
 }
 
-// noteAppend 把已持久化的追加同步进投影缓存。日志行已在
-// 盘上（Append 先写盘再广播），因此没有缓存的会话会冷载
-// 日志——其中已包含 ev——而不是把 ev 折叠两次。冷载读失败
-// 只是放弃缓存：下一次 Messages 会重新冷读。它永远不会
-// 回调进 FileLog，因此 Manager 锁与 FileLog.mu 永远不会
-// 嵌套。
+// noteAppend 把已持久化的追加同步进投影缓存。调用方持有会话
+// state，因此无缓存时的冷读不可能与其他追加交错，也不会把 ev
+// 重复加入内存日志。
 func (m *Manager) noteAppend(id string, ev Event) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if p, ok := m.projs[id]; ok {
-		p.events = append(p.events, ev)
+		p.events = append(p.events, cloneEvent(ev))
 		return
 	}
-	// 错误被有意丢弃：磁盘日志是兜底。
+	// 冷读失败只放弃缓存；磁盘日志仍是权威，下次 Messages 会重试。
 	_, _ = m.projection(id)
 }

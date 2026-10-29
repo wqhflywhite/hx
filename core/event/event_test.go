@@ -1,6 +1,7 @@
 package event_test
 
 import (
+	"context"
 	"strings"
 	"testing"
 
@@ -83,15 +84,15 @@ func TestWaterfallOnionAndShortCircuit(t *testing.T) {
 	defer root.Dispose()
 	ctx := root.Context()
 
-	event.OnWaterfall[string, string](ctx, "test/wf", func(_ *fiber.Context, in string, next event.Next[string, string]) (string, error) {
-		out, err := next(ctx2(ctx), "("+in)
+	event.OnWaterfall[string, string](ctx, "test/wf", func(_ context.Context, _ *fiber.Context, in string, next event.Next[string, string]) (string, error) {
+		out, err := next(context.Background(), ctx2(ctx), "("+in)
 		return out + ")", err
 	})
-	event.OnWaterfall[string, string](ctx, "test/wf", func(_ *fiber.Context, in string, next event.Next[string, string]) (string, error) {
-		out, err := next(ctx2(ctx), "["+in)
+	event.OnWaterfall[string, string](ctx, "test/wf", func(_ context.Context, _ *fiber.Context, in string, next event.Next[string, string]) (string, error) {
+		out, err := next(context.Background(), ctx2(ctx), "["+in)
 		return out + "]", err
 	})
-	out, err := event.Waterfall[string, string](ctx, "test/wf", "x", func(_ *fiber.Context, in string) (string, error) {
+	out, err := event.Waterfall[string, string](ctx, context.Background(), "test/wf", "x", func(_ context.Context, _ *fiber.Context, in string) (string, error) {
 		return in + ".", nil
 	})
 	if err != nil {
@@ -102,11 +103,11 @@ func TestWaterfallOnionAndShortCircuit(t *testing.T) {
 	}
 
 	// 跳过 next 的中间件会短路整条链。
-	event.OnWaterfall[string, string](ctx, "test/wf2", func(_ *fiber.Context, in string, _ event.Next[string, string]) (string, error) {
+	event.OnWaterfall[string, string](ctx, "test/wf2", func(_ context.Context, _ *fiber.Context, in string, _ event.Next[string, string]) (string, error) {
 		return "cut:" + in, nil
 	})
 	terminalRan := false
-	out, err = event.Waterfall[string, string](ctx, "test/wf2", "x", func(_ *fiber.Context, in string) (string, error) {
+	out, err = event.Waterfall[string, string](ctx, context.Background(), "test/wf2", "x", func(_ context.Context, _ *fiber.Context, in string) (string, error) {
 		terminalRan = true
 		return in, nil
 	})
@@ -143,8 +144,8 @@ func TestKindConflictPanics(t *testing.T) {
 			t.Fatal("same-name different-kind registration must panic")
 		}
 	}()
-	event.OnWaterfall[string, string](ctx, "test/kind", func(_ *fiber.Context, in string, next event.Next[string, string]) (string, error) {
-		return next(ctx2(ctx), in)
+	event.OnWaterfall[string, string](ctx, "test/kind", func(_ context.Context, _ *fiber.Context, in string, next event.Next[string, string]) (string, error) {
+		return next(context.Background(), ctx2(ctx), in)
 	})
 }
 

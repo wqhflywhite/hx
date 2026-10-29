@@ -36,51 +36,51 @@ hx 是对 DeepSeek Harness（dsh，`deepseek-ai/deepseek-harness`）架构脊柱
 └──────────────────────────────────────────────────┘
 ```
 
-## 包清单（15,128 行，其中测试 7,026 行）
+## 包清单（18,539 行，其中测试 9,268 行）
 
 ### 内核三层（M1）
 
 | 包 | 行数 | 职责 |
 |---|---|---|
-| `core/fiber` | 363 | 可逆副作用容器树。`Effect` 是唯一注册入口；`Provide[T]`/`Get[T]` 泛型服务存取（祖先链优先、未命中回退全树搜索——插件挂在子 fiber 上，父/兄弟需可见）；`Dispose` 幂等、LIFO、级联子 fiber；`Done` channel 供插件 goroutine 挂靠生命周期 |
-| `core/event` | 219 | 泛型事件总线。`Emit`（同步广播）、`Parallel`（扇出聚合错误）、`Serial`（bail 即停）、`Waterfall`（洋葱中间件，不调 next 即短路）；注册时记录 payload 类型，同名冲突挂载即 panic |
+| `core/fiber` | 437 | 可逆副作用容器树。`Effect` 是唯一注册入口；`Provide[T]`/`Get[T]` 泛型服务存取（祖先链优先，普通 fiber 回退全树、generation 只搜索本代与 pinned 区域）；`Dispose` 幂等、LIFO、级联子 fiber，并发调用等待同一清理结果；`Done` channel 供插件 goroutine 挂靠生命周期 |
+| `core/event` | 223 | 泛型事件总线。`Emit`（同步广播）、`Parallel`（扇出聚合错误）、`Serial`（bail 即停）、`Waterfall`（洋葱中间件并贯穿 context，不调 next 即短路）；注册时记录 payload 类型，同名冲突挂载即 panic，Effect 失败回滚监听器 |
 | `core/plugin` | 106 | 编译期注册表 + inject 激活。依赖未就绪时 fiber 异步等待（generation 条件变量），`Provide` 唤醒；服务撤销时经 `OnRevoked` 钩子级联 Dispose 依赖方 |
 
 ### 能力 seam（M2）
 
 | 包 | 行数 | 职责 |
 |---|---|---|
-| `session` | 825 | JSONL 追加日志（`~/.hx/sessions/`，env `HX_SESSIONS_DIR` 或 config `dir` 覆盖）。**写盘后 fsync 再广播 `session/event`**（断电可保，不再只到页缓存）；`readEvents` 遇第一个 JSON 坏行即截断返回之前的好事件（崩溃写了一半的行及其之后一律不可信），不再整个会话恢复失败；`DeriveMessages` 是模型历史的唯一投影**定义**（`session/summary` 事件以 `SummaryData.ThroughSeq` 记录实际覆盖的最后一条原始事件序索引：最新 summary 的内容作为 user 消息领投，`ThroughSeq+1` 之后的事件无论物理上位于 summary 前后都保留在投影中（缺省 0 只覆盖序索引 0，不回退旧位置语义）；`SummaryData.FirstKept`（`json:"first_kept,omitempty"`，缺省 0 = 旧行为，旧日志零迁移）钉住头部 `keep_first_events` 条不进压缩区；`session/prune` 事件（载荷 `PruneData{Seq, Content}`，Seq = 被剪事件在日志中的序索引、只能指向它之前的事件）把超长 tool/result 的投影改写为省略标注版）；运行时经 `Manager.Messages` 水位增量 fold（projection.go：写盘成功镜像进内存日志、只折 `[wm:]` 尾部、冷读磁盘兜底自愈，缓存可陈旧不可错、永不作权威，等价性有逐事件机器断言）；`Fork` 复制前缀；时钟与 id 生成器全部注入（黄金测试逐字节相等的前提） |
-| `llm` | 183 | 适配器 seam。**命名注册表**：`SetAdapter(name, a)`，同一实现可多实例挂载；`Request.Provider` 按名路由，空名走默认（显式 `SetDefault`，失效回落最早注册）；`Stream` 经 `llm/stream` waterfall，retry/计量等以监听器身份挂入 |
-| `llm/deepseek` | 320 | OpenAI 兼容 provider：`POST {base_url}/chat/completions`，`net/http` + 手写 SSE 解析；config `base_url`/`api_key`/`model`/`name`，env 回退 `DEEPSEEK_*`。所有 OpenAI 兼容厂商（OpenAI/OpenRouter/Moonshot/智谱/Ollama/vLLM…）换三个配置项即用 |
-| `tools` | 142 | 工具注册表（`Register` 返 disposer）+ 执行流水线：`tools/pre-execute`（waterfall，可改写/拒绝）→ execute → `tools/post-execute`（waterfall，可改写结果）→ 结果由调用方落日志 |
-| `tools/builtin` | 256 | 内置工具：`bash`（Windows `cmd /C` / Unix `sh -c`，超时 + 输出截断）、`read_file`、`write_file`、`edit`（str_replace 唯一匹配替换） |
-| `prompt` | 126 | 提示词分片（`Section{Name,Order,Render}`）注册返 disposer；`Assemble` 拼系统提示词并从 tools 注册表现取 schema；新增 `prompt/tools` waterfall 缝——工具 schema 列表出厂前过一道瀑布（零监听器逐字节不变），toolgate 借此裁剪内联集合 |
+| `session` | 876 | JSONL 追加日志（`~/.hx/sessions/`，env `HX_SESSIONS_DIR` 或 config `dir` 覆盖）。同会话所有 Resume 句柄共享顺序锁，写盘、fsync、缓存更新和冷读顺序一致；`Event.Data` 在输入、返回和广播边界深拷贝；读取无固定行上限，坏后缀在 Resume 时物理截断并 fsync。`DeriveMessages` 是全量投影定义，summary 以 `ThroughSeq` 标记水位、`FirstKept` 钉住头部，prune 只改模型视图；增量 fold 与全量逐事件等价，`Fork` 复制前缀，时钟与 id 生成器均可注入 |
+| `llm` | 190 | 适配器 seam。**命名注册表**：`SetAdapter(name, a)` 支持热重挂替换与逆序回滚，旧 disposer 不误删新实例；`Request.Provider` 按名路由，空名走默认；`Stream` 经带 ctx 的 `llm/stream` waterfall |
+| `llm/deepseek` | 342 | OpenAI 兼容 provider：`POST {base_url}/chat/completions`，`net/http` + 手写 SSE 解析；只有显式 `[DONE]` 是正常终态，异常 EOF、错误帧与取消均向上报错，稀疏 tool_call index 按实际 key 排序；config `base_url`/`api_key`/`model`/`name`，env 回退 `DEEPSEEK_*` |
+| `tools` | 146 | 工具注册表（`Register` 返 disposer）+ 执行流水线：`tools/pre-execute` → execute → `tools/post-execute`，`context.Context` 贯穿瀑布和工具实现，结果由调用方落日志 |
+| `tools/builtin` | 467 | 内置工具：`bash`（Windows `cmd /C` / Unix `sh -c`，继承 turn ctx、超时、进程组/Job Object/进程树回退清理、流式有界输出）、`read_file`（LimitReader 硬上限）、`write_file`、`edit` |
+| `prompt` | 135 | 提示词分片（`Section{Name,Order,Render}`）注册返 disposer；`Assemble` 按 `(Order,Name)` 确定顺序拼系统提示词并收集 tools schema；`prompt/tools` waterfall 供 toolgate 裁剪内联集合 |
 | `agent` | 87 | Agent 注册表 + **Factory seam**：注册表不创建 agent，`SetFactory` 返 disposer、重复注册 panic；未注册工厂时报明确错误 |
 
 ### 驱动器（M2 + M4c）
 
 | 包 | 行数 | 职责 |
 |---|---|---|
-| `agentloop` | 270 | 默认 ReAct 驱动器。turn/step 语义；inbox 为 buffered channel；取消走 `context.Context` + fiber done 双轨；**一切模型可见内容先落日志再广播**；每 step 投影前可选调用 compaction 服务（Consumer）；`Apply` 时经 `ctx.Effect` 把自己注册为 Factory |
-| `agentloop/oneshot` | 233 | 替代驱动器（工厂 seam 的试金石）：一步带工具 + 一步无工具收尾。配置里把 `agentloop` 换成 `oneshotloop` 即整体替换，事件序列与默认 loop 逐字节对齐 |
+| `agentloop` | 293 | 默认 ReAct 驱动器。turn/step 语义；取消走 `context.Context` + fiber done 双轨并贯穿工具/审批；**一切模型可见内容先落日志再广播**；流错误不留下悬空 tool calls；Dispose 等待 run 退出再关日志；每 step 可选调用 compaction |
+| `agentloop/oneshot` | 263 | 替代驱动器：一步带工具 + 一步无工具收尾。配置里把 `agentloop` 换成 `oneshotloop` 即整体替换，默认路径事件序列与默认 loop 逐字节对齐 |
 
 ### M3/M4 新增
 
 | 包 | 行数 | 职责 |
 |---|---|---|
-| `approval` | 152 | 工具审批。监听 `tools/pre-execute`；`mode` 支持 `"auto"` / `"ask"` / 按工具名 map（`"*"` 改默认，未列出回落 ask）；`Prompter` 接口注入（stdin / TUI / 测试 fake 三种实现）；拒绝即短路 waterfall，错误进 `tool/result` |
-| `tui` | 332 | bubbletea TUI。`render.go` 为纯函数投影（session 事件 → 视图行：流式 chunk 增量、tool/call+result 折叠一行、turn 错误行），可单测；`tui.go` 为薄壳：alt-screen、尾部滚动、y/n 审批抢占键盘 |
-| `hxconfig` | 328 | `hx.yml` 组合 + **双层 fiber Stack**：pinned 层（hx.yml 顶层 `pinned` 字段声明，默认 session/llm，持有会话日志，reload 不动）+ `layer` 层（其余全部插件）；`Reload` 先建新层成功才 dispose 旧层（坏配置不炸运行中的实例）；重建前对比新旧 pinned 集合（顺序无关），变了即拒绝本次重载、错误含新旧名单并提示重启，旧层保持运行；fsnotify `Watch` 150ms 防抖 |
-| `web` | 534 | Web UI：stdlib `net/http` + `go:embed` 单页前端。SSE hub 一把互斥锁串行化 backfill 快照/live 广播/客户端注册（无间隙无重复），慢消费者断开而不是阻塞广播；`Prompter` 实现 `approval.Prompter`，浏览器 POST 答复前阻塞 agent goroutine |
-| `subagent` | 201 | 子代理委派（multi-agent）。`delegate` 工具挂进共享 tools 注册表：经 "agents" seam 创建子 agent（**独立会话日志**、步数预算继承 agentloop 配置），订阅子会话 `turn/end` 等完成，取最后一条 assistant/message 作为工具结果；总超时（默认 120s）到点即 Dispose 子 fiber；等待 select 含调用方 fiber Done 分支——热重挂/父 agent 撤销时即时解开返回（嵌套委派不再逐层拖超时），超时与被撤销的错误都带子 session id + 子 agent 部分答案（回读子会话投影取最后一条非空 assistant 消息，截断 500 rune）。**深度闸**数 fiber 祖先链上 `agent:` 前缀节点，默认 `max_depth: 1`——子 agent 看得到 delegate 工具（共享注册表），但调了就被拒，递归委派在机制上不可能 |
-| `compaction` | 364 | 上下文压缩 seam。Definition：`Compactor` 接口（`MaybeCompact`，服务名 "compaction"）；Provider：投影估算 token（字符数/4 启发式）超 `max_context_tokens` → **先剪枝后摘要**——水位线之后超过 `prune_bytes`（默认 8192 字节）的 tool/result 投影改写为「头 4096 + 省略标注 + 尾 1024」并以 `session/prune` 事件落日志（守住模型可见 ⟺ 已落日志），剪完回预算内即跳过 LLM 摘要；仍超预算才把上一摘要 `ThroughSeq+1` 起、最近 `keep_recent_events` 条之前的中段渲染成 transcript 调 llm seam 压成摘要，**summary 事件 append 回日志**并记录实际覆盖的 `ThroughSeq`，因此 `keep_recent` 与摘要期间并发追加的事件不会因 summary 物理位置靠后而退出投影；transcript 为**滚动蒸馏**（旧摘要内容 + 其水位线后的全部未覆盖原始事件，包括上一轮保留尾部，压缩 N 次早期上下文不丢）；默认提示词为固定六段结构化模板（## Goal / ## Progress and completed work / ## Key decisions / ## Errors and blockers / ## Relevant files / ## Next steps，目标是"另一个 agent 能无缝接手"），`summary_prompt` 可配置覆盖；`keep_first_events`（默认 1）钉住会话开头初始目标不进压缩区，summary 事件带 `FirstKept`、二次压缩继承前一条，头部边界同样有 tool call/result 配对保护；同会话并发 `MaybeCompact` 共享一次调用与结果，避免重复摘要，等待者可独立响应 ctx 取消或 fiber 撤销，不同会话仍可并行。Consumer：agentloop 每 step 投影前可选调用（`fiber.Get` 未命中即跳过，非 Inject 硬依赖） |
-| `memory` | 338 | 文件派长期记忆（对齐 dsh `agent-instructions` 语义）。监听挂载点 fiber 上的 `turn/start`：把用户级 `~/.hx/memory.md` + 项目级 `.hx/memory.md`（相对 cwd，config `user_file`/`project_file` 覆盖）合成一条 `<system-reminder>` 包裹的 `user/message` **append 进会话日志**（先写盘后广播，经 `session.Opener.Resume` 拿到的写入入口），当轮第一次投影即携带——严格满足"模型可见 ⟺ 已落日志"。SHA-1 digest 按 session 去重（内容不变不重复注入）；最新 summary 比上次注入新（压缩把记忆压进水位线之前）则重新注入；`max_bytes`（默认 30720）字节预算内**宽文件整体省略优先、最具体文件截断兜底**，附预算标注；内容里的 `</system-reminder>` 转义防越框。两文件都缺失/为空则不注入任何事件（零文件行为逐字节不变）；config 非字符串/非 int/两路径撞车全部 fail loud。改记忆文件用通用 write_file/edit（本来就走审批瀑布），无专用工具 |
-| `toolgate` | 315 | 工具闸门（解决"工具特别多怎么办"）。监听 prompt 插件的 `prompt/tools` 瀑布缝：工具总数 ≤ `max_inline`（默认 20，≤0 = 空挂载零行为变化）原样透传；超过则只内联 `always` 名单 + `tool_search` 自身 + 本会话已激活工具。`tool_search` 元工具按 query 对注册表名称+描述打分（名称命中 +2、描述命中 +1），取 top `search_limit`（默认 5）返回完整 schema 并**搜到即激活**，后续请求自动携带。KV cache 纪律：基础集合保持名字序、激活工具按激活先后追加尾部、会话内只增不减；会话键 = 最近 `agent:` 前缀祖先 fiber（无则退化树根）。hx.yml 可选挂载，默认 flatWire 不含它 |
-| `kb` | 1,098 | 知识库 seam。Markdown vault（Obsidian 形态）是事实源，内嵌 SQLite 索引是可弃派生物；`KB` 接口（`Search`/`Read`/`Write`/`Backlinks`，Provide 为 "kb" 服务）+ 四个工具 `kb_search`/`kb_read`/`kb_write`/`kb_lint`。挂载时增量 Sync 全库（sha1 变更检测、消失文件剪除）；fsnotify 递归 watcher 去抖（`debounce_ms` 默认 200）后增量索引，goroutine 挂 fiber 生命周期。`kb_read` 支持 heading 路径选段并返回 etag；`kb_write` 乐观并发（sha1+mtime 不一致即拒绝并提示重新 `kb_read`），写后立即可检索。配了 embedder 时 Sync 按文件批量嵌入 chunk、查询时嵌入 query 走混合检索，嵌入失败即报错不静默降级。`kb_lint` 纯确定性健康检查：断链 wikilink、孤立笔记（无入链且非 raw/）、未索引文件、超 chunk 阈值长文（`lint_max_chunks` 默认 50）。**librarian prompt 段**（`go:embed librarian.md`）：vault 双区约定（raw/ 一篇一文件、wiki/ 概念页带 confidence/sources frontmatter 与双链）、写前必须 kb_read 拿 etag、引用用 `路径#heading` 锚点；kb 不硬依赖 prompt 插件，goroutine 等服务代际（先读代际再查询，不错过唤醒）注册/随 dispose 摘除。config 全走 hx.yml：`vault`（有 config 则必填，flatWire 无 config 空挂载）、`index`、`debounce_ms`、`search_limit`、`lint_max_chunks`、`fts_weight`/`vector_weight`（指针语义：显式 0 关闭该路，配了 embedder 且两路都缺省则各取 1）、`embedder`（base_url/api_key/model，HX_EMBED_* env 兜底，缺字段 fail loud） |
-| `kb/vault` | 152 | Markdown 解析纯函数：frontmatter（yaml.v3）、wikilink 提取（`[[目标]]`/`[[目标\|别名]]`/`[[目标#锚点]]`）、按 heading 层级分块（每块带 heading 路径与起止行号，`path#Lx-Ly` 可寻址） |
-| `kb/index` | 674 | 嵌入式 SQLite 索引（modernc.org/sqlite 纯 Go，保住 CGO_ENABLED=0 静态单二进制）：`files`/`chunks`/`links`/`embeddings` 四表 + FTS5 虚表（trigram 分词，CJK 子串可检索）；单文件原子重索引（向量随同事务重写）、全量重建（可弃入口）、增量变更检测；`Search` 混合检索——FTS top-K 与向量余弦 top-K 各自 min-max 归一化后按权重线性混合重排；FTS 查询构造面向自然语言：latin/数字词段加引号成词元，CJK 段 <3 字丢弃、≥3 字展开为重叠 3 字滑窗词元（一个滑窗=一次 trigram 查找，整句短语查询必然匹配为空），标点全丢弃、全部 OR 组合（recall 优先，bm25+向量管精度，任意输入不破 MATCH）；向量侧暴力扫描（NumCPU 分片并发、空分片裁剪，1 万 chunk×256 维 ≈36ms/次，benchmark 覆盖），余弦 ≤0 的块不进候选；`ChunkCounts`/`OutboundLinks` 支撑 kb_lint 全库体检 |
-| `kb/embed` | 290 | 嵌入能力：`Embedder` 接口（一文本一向量、输入序对齐、维度恒定）+ OpenAI 兼容 provider（POST {base}/embeddings，响应按 index 重排回输入序，HTTP 风格抄 llm/deepseek，client 可注入）+ 确定性 hash 投影 `Fake`（仅测试/eval 用：latin 词段小写化，CJK 段按 `Synonyms` 键贪心最长匹配切分——词表兼作切分词典，可构造零关键词重叠的"语义"命中） |
+| `approval` | 153 | 工具审批。监听 `tools/pre-execute`；`mode` 支持 `"auto"` / `"ask"` / 按工具名 map；`Prompter` 接口注入并响应 ctx 取消；拒绝即短路 waterfall，错误进 `tool/result` |
+| `tui` | 342 | bubbletea TUI。`render.go` 为纯函数投影（session 事件 → 视图行），可单测；`tui.go` 为薄壳：alt-screen、尾部滚动、y/n 审批抢占键盘 |
+| `hxconfig` | 373 | `hx.yml` 组合 + 双层 fiber Stack。新 layer 只能解析本代与 pinned 服务；adapter 支持替换/回滚；`WithLayer` 以读租约覆盖 agent 创建与发布；`ReloadError.Committed` 区分未提交和已提交清理失败；watcher 错误向上上报 |
+| `web` | 629 | Web UI：stdlib `net/http` + `go:embed` 单页前端。默认只监听 loopback，远程模式强制显式 opt-in + token；鉴权覆盖全部端点，POST 校验 JSON/Origin/Host；SSE 慢消费者断开、写错误即返回；审批绑定 agent 代际并响应取消 |
+| `subagent` | 204 | 子代理委派：独立会话日志、步数预算、深度闸与总超时；等待同时响应调用方 ctx 和 fiber Done，撤销/超时错误携带子 session id 与部分答案 |
+| `compaction` | 393 | 上下文压缩 seam。先剪枝后摘要；summary 以 `ThroughSeq` 保留尾部和并发追加事件，滚动蒸馏携带旧摘要；`keep_first_events` 钉住初始目标；prune 幂等且只在摘录更短时落日志，失败重试不重复，工具错误进入摘要；同会话并发共享一次调用 |
+| `memory` | 350 | 文件派长期记忆。turn/start 注入持久 user/message，digest 去重、压缩后重注入；读取有 1 MiB 硬上限，`max_bytes` 内保留完整 system-reminder 开闭框架，非法配置 fail loud |
+| `toolgate` | 327 | 工具闸门：超阈值只内联 always + tool_search + 已激活工具，搜到即激活且 KV cache 顺序稳定；会话清理由锁外 Effect 登记，首次组装与 Dispose 并发不死锁 |
+| `kb` | 1,211 | 知识库 seam。Markdown vault 是事实源，SQLite 索引可弃；增量 Sync 与 watcher 串行避免重复嵌入；`kb_read` 的内容/ETag 同源，`kb_write` 同 ETag 串行校验、临时文件原子替换，索引失败明确报告部分完成；支持混合检索、受控写入、lint 和 librarian prompt |
+| `kb/vault` | 152 | Markdown 解析纯函数：frontmatter、wikilink、按 heading 层级分块与行号锚点 |
+| `kb/index` | 736 | 嵌入式 SQLite 索引（纯 Go）：`files`/`chunks`/`links`/`embeddings`/`metadata` + FTS5 trigram；单连接保证 WAL/busy_timeout 覆盖；记录 provider/model/维度指纹，变化时从 vault 强制全量重建；单文件事务重写与 FTS/向量混合排序 |
+| `kb/embed` | 318 | 嵌入能力：`Embedder` + provider/model 指纹与可选维度声明；OpenAI 兼容 provider 和确定性 `Fake`，响应按输入序对齐 |
 | `kb/eval` | 183 | 离线评测 harness：合成 fixture vault（testdata 入库，16 wiki 概念页 + 24 raw 材料笔记，wikilink 成图，lint-clean 由测试钉住）+ 44 题 gold set（自然语言中文提问，单跳/多跳各 22 题，多跳题与目标笔记零关键词重叠、沿双链 2-3 跳，gold.json 自带 Fake 的 Synonyms 词表桥）；真实语料评测 realvault（14 篇真实中文技术文档 596K、706 chunk，语料含第三方内容不随仓库公开、缺失时测试自跳过）+ 28 题 realgold（单跳/多跳各 14，多跳绕开目标文档用词、零 ≥3 字关键词重叠由检查器钉住）；命中率对比报告（纯 FTS vs 混合 1:1 vs 混合 1:0.5，top-1/top-5 分组）+ 搜索/摄入/重建延迟 benchmark；真 API 评测（HX_EMBED_* 指向 OpenAI 兼容端点，无 env 自跳过）是 README 数字的来源口径 |
 
 ## 使用方式
@@ -93,14 +93,14 @@ export DEEPSEEK_API_KEY=sk-...
 hx "看下当前目录有什么文件并总结"   # 单发任务
 hx chat                            # 行模式多轮
 hx tui                             # TUI（无参数默认）
-hx web                             # Web UI（默认 :7681）
+hx web                             # Web UI（默认 127.0.0.1:7681）
 hx chat --resume <session-id>      # 从日志恢复，上下文逐字节重建
 hx tui --config hx.yml --watch     # 配置组合 + 热重挂
 ```
 
 ### hx web
 
-`hx web [--addr :7681]` 启动浏览器界面：`GET /` 返回 `go:embed` 内嵌的单文件 vanilla JS 页面（无构建步骤）；SSE 端点推送四种信封——`session`（会话事件，连接时先 backfill 全量再续 live，hub 一把锁保证无间隙无重复）、`approval`（待审批工具调用）、`notice`（热重挂等通知）、`session-changed`；POST 端点收输入、审批答复和会话新建/恢复。审批走与 TUI 相同的 `approval.Prompter` seam（`hx/web` 的 Prompter 经 overlays 注入），浏览器 POST 答复前 agent goroutine 一直阻塞，服务器关闭时拒绝所有悬挂审批。hub 订阅在 root ctx 上，配置热重挂重建 layer 后事件流不断。
+`hx web [--addr 127.0.0.1:7681]` 启动浏览器界面，默认仅本机可访问。非 loopback 监听必须同时指定 `--allow-remote` 和 `--auth-token`（或 `HX_WEB_TOKEN`）；token 覆盖首页、SSE 与全部 POST，POST 还校验 JSON Content-Type、Host 和同源 Origin。SSE 推送 `session`/`approval`/`notice`/`session-changed` 四种信封，慢消费者断开、写错误立即返回。审批绑定 agent 代际，会话切换后旧回答失效，取消或关闭服务器会解除悬挂等待。hub 订阅在 root ctx 上，配置热重挂后事件流不断。
 
 子命令须放在旗标之前（`hx chat --config x.yml`，Go flag 包的标准行为）。
 
@@ -249,16 +249,16 @@ HX_EMBED_BASE_URL=... HX_EMBED_API_KEY=... HX_EMBED_MODEL=... \
 - **toolgate 测试**（`toolgate/toolgate_test.go`）：工具总数 ≤ `max_inline` 原样透传、超过只内联 `always` + `tool_search` + 本会话已激活；`tool_search` 打分（名称 +2/描述 +1）取 top `search_limit` 返回完整 schema 且**搜到即激活**、后续请求自动携带；顺序稳定性（基础集合名字序、激活工具按激活先后追加尾部、会话内只增不减，KV cache 友好）；会话键取最近 `agent:` 前缀祖先 fiber（无则退化树根）；零监听器与 `max_inline ≤ 0` 空挂载逐字节不变；
 - **kb 测试**（`kb/vault` 表驱动 + `kb/index` + `kb/embed` + `kb/kb_test.go`）：frontmatter 缺失/未闭合/损坏、嵌套 heading 栈、别名与锚点 wikilink、CRLF；增量索引幂等（同 sha1 跳过重索引、重复索引不产生重复命中）、重索引替换旧内容、Rebuild 全量可弃、FTS 归一化排序与权重缩放、敌意查询不破 MATCH；混合排序确定性（FTS 路笔记与向量路笔记随权重翻转、显式 0 权重 ≠ 未设置、无查询文本的纯向量检索、余弦 ≤0 不进候选）、重索引重写向量表、向量数与 chunk 数不齐 fail loud、1 万 chunk×256 维暴力扫描 benchmark；OpenAI provider httptest 线格式（路径/Bearer/body、乱序 index 按输入序还原、无 key 不发 Authorization、500 带 body 摘要）、HX_EMBED_* env 兜底与缺字段 fail loud、Fake 确定性/单位范数/同义词余弦≈1、真 API 无 env 自跳过；embedder 配置段端到端（Sync 一次批量嵌入 + 搜索一次查询嵌入，调用计数断言）与非法段 fail loud；`kb_lint` 四类问题（断链/孤立/未索引/长文）各自构造命中、修复后复检、工具层健康文案与拒参；librarian prompt 段后挂载 prompt 也能等到注册（代际等待无错过唤醒）、dispose 后摘除；etag 冲突拒绝且不覆盖文件、写后立即可检索、watcher 去抖后新文件可检索/删除文件被剪除（5 秒上界轮询断言）、config 非法 fail loud、nil config 空挂载、Dispose 回收工具与 watcher goroutine（NumGoroutine 前后对比）；
 - **kb/eval 测试**：fixture vault lint-clean 钉住（双链图完整性）；gold set 三模式对比（纯 FTS / 混合 1:1 / 混合 1:0.5）——多跳题纯 FTS top-5 恒 0（零关键词重叠由断言钉住）、混合严格更优、1:0.5 软混合追回单跳 top-1；混合模式连跑两遍命中逐题一致（确定性）；搜索 p95 / 摄入 p50·p95 / 全量重建 benchmark；realvault 真实语料腿——FTS-only 确定性断言（单跳 top-5 ≥10、多跳 top-5 ≤2）+ 真 embedder 双报告（自跳过）+ miss 诊断（`realdiag_test.go` 打印混合 top-5 两路分数，7 道 miss 答案级判定 3/7 能用）；真 API 评测（自跳过）是 README 命中率数字的来源口径；
-- 全部在 `go test -race -count=1 ./...` 下通过（26 个包，20 个有测试）。
+- 标准验收为 `go build ./...`、`go vet ./...`、`go test -count=1 ./...`；并发、生命周期与共享状态改动还需在 Linux 环境执行 `go test -race -count=1 ./...`（26 个包，24 个有测试）。
 
 ## 数字
 
 | 指标 | 值 |
 |---|---|
-| 总行数 | 16,200（实现 8,462 + 测试 7,738） |
+| 总行数 | 18,539（实现 9,271 + 测试 9,268） |
 | 直接依赖 | 5 个：`bubbletea`、`lipgloss`、`fsnotify`、`yaml.v3`、`modernc.org/sqlite` |
 | 间接依赖 | 24 个（bubbletea/lipgloss 终端链 + modernc.org/sqlite 链） |
-| 分发 | 单静态二进制 17.9 MiB（18,771,968 字节，CGO_ENABLED=0），`go build` |
+| 分发 | 单静态二进制 18.0 MiB（18,905,600 字节，CGO_ENABLED=0），`go build` |
 | 对比 dsh | 227 包 / 649 依赖版本 / tsc 双 face + tsdown / Node + tsx + n-API |
 
 ## 里程碑完成情况

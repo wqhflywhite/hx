@@ -6,11 +6,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"hx/core/fiber"
@@ -50,7 +52,7 @@ type bashArgs struct {
 }
 
 // Execute 实现 tools.Tool。
-func (Bash) Execute(_ *fiber.Context, args json.RawMessage) (any, error) {
+func (Bash) Execute(ctx context.Context, _ *fiber.Context, args json.RawMessage) (any, error) {
 	var a bashArgs
 	if err := json.Unmarshal(args, &a); err != nil {
 		return nil, fmt.Errorf("bash: bad arguments: %w", err)
@@ -62,20 +64,38 @@ func (Bash) Execute(_ *fiber.Context, args json.RawMessage) (any, error) {
 	if a.TimeoutSeconds > 0 {
 		timeout = time.Duration(a.TimeoutSeconds) * time.Second
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	cmd := shellCommand(ctx, a.Command)
-	var buf bytes.Buffer
+	cmd := shellCommand(a.Command)
+	cmd.WaitDelay = 2 * time.Second
+	var buf limitedBuffer
 	cmd.Stdout = &buf
 	cmd.Stderr = &buf
-	runErr := cmd.Run()
-	out := buf.String()
-	if len(out) > maxOutput {
-		out = out[:maxOutput] + fmt.Sprintf("\n... [truncated, %d bytes total]", len(out))
+	proc, err := startProcess(cmd)
+	if err != nil {
+		return nil, err
 	}
+	defer proc.Close()
+	wait := make(chan error, 1)
+	go func() { wait <- cmd.Wait() }()
+	var runErr error
+	select {
+	case runErr = <-wait:
+	case <-ctx.Done():
+		_ = proc.Kill()
+		select {
+		case runErr = <-wait:
+		case <-time.After(2 * time.Second):
+			return buf.String(), fmt.Errorf("bash: process did not exit after %v", ctx.Err())
+		}
+	}
+	out := buf.String()
 	if ctx.Err() == context.DeadlineExceeded {
 		return out + fmt.Sprintf("\n[killed: timeout after %s]", timeout), nil
+	}
+	if ctx.Err() != nil {
+		return out + fmt.Sprintf("\n[killed: %v]", ctx.Err()), nil
 	}
 	if runErr != nil {
 		return out + fmt.Sprintf("\n[exit: %v]", runErr), nil
@@ -83,13 +103,40 @@ func (Bash) Execute(_ *fiber.Context, args json.RawMessage) (any, error) {
 	return out, nil
 }
 
-// shellCommand 构造平台相关的 shell 调用；这是唯一允许
-// 出现平台分支的地方。
-func shellCommand(ctx context.Context, command string) *exec.Cmd {
-	if runtime.GOOS == "windows" {
-		return exec.CommandContext(ctx, "cmd", "/C", command)
+// limitedBuffer 只保留前 maxOutput 字节，同时统计完整输出量；
+// stdout/stderr 并发写入也不会先无界增长再截断。
+type limitedBuffer struct {
+	mu    sync.Mutex
+	buf   bytes.Buffer
+	total int64
+}
+
+func (b *limitedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.total += int64(len(p))
+	if remain := maxOutput - b.buf.Len(); remain > 0 {
+		b.buf.Write(p[:min(len(p), remain)])
 	}
-	return exec.CommandContext(ctx, "sh", "-c", command)
+	return len(p), nil
+}
+
+func (b *limitedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	out := b.buf.String()
+	if b.total > maxOutput {
+		out += fmt.Sprintf("\n... [truncated, %d bytes total]", b.total)
+	}
+	return out
+}
+
+// shellCommand 构造平台相关的 shell 调用；进程树清理由平台文件负责。
+func shellCommand(command string) *exec.Cmd {
+	if runtime.GOOS == "windows" {
+		return exec.Command("cmd", "/C", command)
+	}
+	return exec.Command("sh", "-c", command)
 }
 
 // ReadFile 返回文件的（可能被截断的）内容。
@@ -115,18 +162,28 @@ type readFileArgs struct {
 }
 
 // Execute 实现 tools.Tool。
-func (ReadFile) Execute(_ *fiber.Context, args json.RawMessage) (any, error) {
+func (ReadFile) Execute(ctx context.Context, _ *fiber.Context, args json.RawMessage) (any, error) {
 	var a readFileArgs
 	if err := json.Unmarshal(args, &a); err != nil {
 		return nil, fmt.Errorf("read_file: bad arguments: %w", err)
 	}
-	data, err := os.ReadFile(a.Path)
+	f, err := os.Open(a.Path)
 	if err != nil {
 		return nil, err
 	}
-	out := string(data)
-	if len(out) > maxOutput {
-		out = out[:maxOutput] + fmt.Sprintf("\n... [truncated, %d bytes total]", len(out))
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	data, err := io.ReadAll(io.LimitReader(f, maxOutput+1))
+	if err != nil {
+		return nil, err
+	}
+	out := string(data[:min(len(data), maxOutput)])
+	if len(data) > maxOutput {
+		total := max(info.Size(), int64(len(data)))
+		out += fmt.Sprintf("\n... [truncated, %d bytes total]", total)
 	}
 	return out, nil
 }
@@ -156,7 +213,7 @@ type writeFileArgs struct {
 }
 
 // Execute 实现 tools.Tool。
-func (WriteFile) Execute(_ *fiber.Context, args json.RawMessage) (any, error) {
+func (WriteFile) Execute(ctx context.Context, _ *fiber.Context, args json.RawMessage) (any, error) {
 	var a writeFileArgs
 	if err := json.Unmarshal(args, &a); err != nil {
 		return nil, fmt.Errorf("write_file: bad arguments: %w", err)
@@ -199,7 +256,7 @@ type editArgs struct {
 }
 
 // Execute 实现 tools.Tool。
-func (Edit) Execute(_ *fiber.Context, args json.RawMessage) (any, error) {
+func (Edit) Execute(ctx context.Context, _ *fiber.Context, args json.RawMessage) (any, error) {
 	var a editArgs
 	if err := json.Unmarshal(args, &a); err != nil {
 		return nil, fmt.Errorf("edit: bad arguments: %w", err)

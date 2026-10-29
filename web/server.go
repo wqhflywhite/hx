@@ -5,13 +5,18 @@
 package web
 
 import (
+	"crypto/subtle"
 	_ "embed"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"mime"
+	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
+	"time"
 
 	"hx/core/event"
 	"hx/core/fiber"
@@ -169,31 +174,29 @@ func (h *hub) close() {
 	}
 }
 
-// Options 把 server 接入 harness；每个字段都必须设置。
+// Options 把 server 接入 harness。AuthToken 设置后保护全部 HTTP
+// 端点；AllowRemote 是非 loopback 监听的显式安全确认。
 type Options struct {
-	// Prompter 通过 POST /api/approval 应答审批提问。
-	Prompter *Prompter
-	// Send 把一条用户输入排入正在运行的 agent。
-	Send func(text string)
-	// CurrentSession 报告正在运行的 agent 的会话 id。
+	Prompter       *Prompter
+	Send           func(text string)
 	CurrentSession func() string
-	// LoadEvents 读取一个会话的完整日志。
-	LoadEvents func(id string) ([]session.Event, error)
-	// ListSessions 返回所有已知会话的 id。
-	ListSessions func() ([]string, error)
-	// NewSession 在一个新会话上重建 agent 并返回其 id。
-	NewSession func() (string, error)
-	// ResumeSession 在一个已存在的会话上重建 agent。
-	ResumeSession func(id string) (string, error)
+	LoadEvents     func(id string) ([]session.Event, error)
+	ListSessions   func() ([]string, error)
+	NewSession     func() (string, error)
+	ResumeSession  func(id string) (string, error)
+	AuthToken      string
+	AllowRemote    bool
 }
 
 // Server 是 HTTP 前端：内嵌 UI、SSE hub 与命令端点。
 type Server struct {
-	opts Options
-	hub  *hub
-	mux  *http.ServeMux
-	done chan struct{}
-	once sync.Once
+	opts        Options
+	hub         *hub
+	mux         *http.ServeMux
+	handler     http.Handler
+	allowedHost string
+	done        chan struct{}
+	once        sync.Once
 }
 
 // NewServer 构建 server 并把 Prompter 的提问路由进 hub；
@@ -202,7 +205,7 @@ func NewServer(opts Options) (*Server, error) {
 	if opts.Prompter == nil || opts.Send == nil || opts.CurrentSession == nil ||
 		opts.LoadEvents == nil || opts.ListSessions == nil ||
 		opts.NewSession == nil || opts.ResumeSession == nil {
-		return nil, fmt.Errorf("web: every Options field must be set")
+		return nil, fmt.Errorf("web: every Options callback must be set")
 	}
 	s := &Server{opts: opts, hub: newHub(), mux: http.NewServeMux(), done: make(chan struct{})}
 	opts.Prompter.setNotify(s.hub.publishApproval)
@@ -213,31 +216,68 @@ func NewServer(opts Options) (*Server, error) {
 	s.mux.HandleFunc("GET /api/sessions", s.handleSessions)
 	s.mux.HandleFunc("POST /api/session/new", s.handleSessionNew)
 	s.mux.HandleFunc("POST /api/session/resume", s.handleSessionResume)
+	s.handler = s.secure(s.mux)
 	return s, nil
 }
 
-// Handler 返回 HTTP handler，供测试与内嵌使用。
-func (s *Server) Handler() http.Handler { return s.mux }
+func hostName(value string) string {
+	if host, _, err := net.SplitHostPort(value); err == nil {
+		return host
+	}
+	return strings.Trim(value, "[]")
+}
+
+func loopbackHost(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+func (s *Server) secure(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.opts.AuthToken != "" {
+			token := r.Header.Get("X-HX-Token")
+			if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
+				token = strings.TrimPrefix(auth, "Bearer ")
+			}
+			if subtle.ConstantTimeCompare([]byte(token), []byte(s.opts.AuthToken)) != 1 {
+				http.Error(w, "web: unauthorized", http.StatusUnauthorized)
+				return
+			}
+		}
+		if s.allowedHost != "" {
+			host := hostName(r.Host)
+			if host != s.allowedHost && !(loopbackHost(host) && loopbackHost(s.allowedHost)) {
+				http.Error(w, "web: forbidden host", http.StatusForbidden)
+				return
+			}
+		}
+		if r.Method == http.MethodPost && r.Header.Get("Origin") != "" {
+			origin, err := url.Parse(r.Header.Get("Origin"))
+			if err != nil || origin.Host != r.Host {
+				http.Error(w, "web: cross-origin request rejected", http.StatusForbidden)
+				return
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// Handler 返回带鉴权与来源校验的 HTTP handler。
+func (s *Server) Handler() http.Handler { return s.handler }
 
 // SubscribeEvents 把从 ctx 可见的会话事件路由进 hub。
-// 务必在根 context 上订阅：事件总线沿发射者的祖先链
-// 收集监听器，因此热重挂配置后在新层上重建的 agent
-// 依然对外可见。
 func (s *Server) SubscribeEvents(ctx *fiber.Context) fiber.Disposer {
 	return event.On[session.Event](ctx, "session/event", func(_ *fiber.Context, ev session.Event) {
 		s.hub.publishEvent(ev)
 	})
 }
 
-// SetSession 把 id 设为当前会话并广播 "session-changed"；
-// events 是该会话目前为止的日志。在启动时、agent 仍处于空
-// 闲时，用正在运行的 agent 的会话调用一次。
 func (s *Server) SetSession(id string, events []session.Event) { s.hub.setSession(id, events) }
+func (s *Server) Notify(text string)                           { s.hub.publishNotice(text) }
 
-// Notify 向所有已连接的客户端广播一条通知信封。
-func (s *Server) Notify(text string) { s.hub.publishNotice(text) }
-
-// Close 结束所有 SSE 流并拒绝待处理的审批；它是幂等的。
 func (s *Server) Close() {
 	s.once.Do(func() {
 		close(s.done)
@@ -246,13 +286,28 @@ func (s *Server) Close() {
 	})
 }
 
-// Run 在 ctx（每个 agent fiber 的祖先）上订阅事件总线，并持
-// 续服务，直到 ctx 的 fiber 被 dispose 或监听器失败。
+// Run 校验监听安全边界后持续服务，直到 ctx 被撤销或监听器失败。
 func (s *Server) Run(ctx *fiber.Context, addr string) error {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("web: invalid listen address %q: %w", addr, err)
+	}
+	if !loopbackHost(host) {
+		if !s.opts.AllowRemote {
+			return fmt.Errorf("web: non-loopback listen requires explicit remote opt-in")
+		}
+		if s.opts.AuthToken == "" {
+			return fmt.Errorf("web: non-loopback listen requires an auth token")
+		}
+	}
+	s.allowedHost = host
 	d := s.SubscribeEvents(ctx)
 	defer func() { _ = d() }()
 	defer s.Close()
-	hs := &http.Server{Addr: addr, Handler: s.mux}
+	hs := &http.Server{
+		Addr: addr, Handler: s.handler,
+		ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, IdleTimeout: 60 * time.Second,
+	}
 	go func() {
 		select {
 		case <-ctx.Fiber().Done():
@@ -260,7 +315,7 @@ func (s *Server) Run(ctx *fiber.Context, addr string) error {
 		}
 		_ = hs.Close()
 	}()
-	err := hs.ListenAndServe()
+	err = hs.ListenAndServe()
 	if errors.Is(err, http.ErrServerClosed) {
 		return nil
 	}
@@ -272,10 +327,10 @@ func (s *Server) handleIndex(w http.ResponseWriter, _ *http.Request) {
 	_, _ = w.Write(indexHTML)
 }
 
-// writeSSE 封装一条消息；raw 不得包含换行（json.Marshal 保
-// 证这一点）。
-func writeSSE(w http.ResponseWriter, raw []byte) {
-	_, _ = fmt.Fprintf(w, "data: %s\n\n", raw)
+// writeSSE 封装一条消息并返回写错误；raw 不得包含换行。
+func writeSSE(w http.ResponseWriter, raw []byte) error {
+	_, err := fmt.Fprintf(w, "data: %s\n\n", raw)
+	return err
 }
 
 func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
@@ -293,22 +348,26 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	for _, ev := range backfill {
+		if r.Context().Err() != nil {
+			return
+		}
 		ev := ev
-		writeSSE(w, mustEnvelope(envelope{Kind: kindSession, Event: &ev}))
+		if writeSSE(w, mustEnvelope(envelope{Kind: kindSession, Event: &ev})) != nil {
+			return
+		}
 	}
-	// 迟到的客户端也能看到连接前提出的审批；随后可能再收到一份
-	// 实时副本，客户端按 id 去重。
 	for _, p := range s.opts.Prompter.Pending() {
-		writeSSE(w, mustEnvelope(envelope{Kind: kindApproval, ID: p.ID, Name: p.Name, Arguments: p.Arguments}))
+		if writeSSE(w, mustEnvelope(envelope{Kind: kindApproval, ID: p.ID, Name: p.Name, Arguments: p.Arguments})) != nil {
+			return
+		}
 	}
 	flusher.Flush()
 	for {
 		select {
 		case raw, ok := <-ch:
-			if !ok {
+			if !ok || writeSSE(w, raw) != nil {
 				return
 			}
-			writeSSE(w, raw)
 			flusher.Flush()
 		case <-r.Context().Done():
 			return
@@ -318,9 +377,13 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// decodeJSON 读取一个 JSON 对象请求体，拒绝未知字段与过大的
-// 载荷；失败时写出 400 响应。
+// decodeJSON 校验 JSON Content-Type，并拒绝未知字段与过大载荷。
 func decodeJSON(w http.ResponseWriter, r *http.Request, v any) bool {
+	contentType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if err != nil || contentType != "application/json" {
+		http.Error(w, "web: Content-Type must be application/json", http.StatusUnsupportedMediaType)
+		return false
+	}
 	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(v); err != nil {
@@ -381,6 +444,7 @@ func (s *Server) handleSessions(w http.ResponseWriter, _ *http.Request) {
 // changeSession 执行重建回调，重载 hub 的日志副本，并广播
 // "session-changed"。
 func (s *Server) changeSession(recreate func() (string, error)) (string, error) {
+	s.opts.Prompter.Invalidate()
 	id, err := recreate()
 	if err != nil {
 		return "", err

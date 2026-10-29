@@ -24,6 +24,17 @@ type Fake struct {
 	Synonyms map[string]string
 }
 
+// Fingerprint 标识 fake 的向量空间；维度另由索引元数据校验。
+func (f Fake) Fingerprint() string { return "fake" }
+
+// Dimension 返回 fake 在配置求值后的向量维度。
+func (f Fake) Dimension() int {
+	if f.Dim <= 0 {
+		return 64
+	}
+	return f.Dim
+}
+
 // Embed 实现 Embedder。
 func (f Fake) Embed(_ context.Context, texts []string) ([][]float32, error) {
 	dim := f.Dim

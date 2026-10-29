@@ -1,6 +1,7 @@
 package agentloop_test
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -75,7 +76,7 @@ func (fakeTool) Name() string { return "fake_tool" }
 func (fakeTool) Schema() map[string]any {
 	return map[string]any{"description": "test double", "type": "object"}
 }
-func (fakeTool) Execute(_ *fiber.Context, _ json.RawMessage) (any, error) {
+func (fakeTool) Execute(_ context.Context, _ *fiber.Context, _ json.RawMessage) (any, error) {
 	return "fake-output", nil
 }
 

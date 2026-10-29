@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS files(path TEXT PRIMARY KEY, sha1 TEXT NOT NULL, mtim
 CREATE TABLE IF NOT EXISTS chunks(file TEXT NOT NULL, idx INTEGER NOT NULL, heading_path TEXT NOT NULL, text TEXT NOT NULL, PRIMARY KEY(file, idx));
 CREATE TABLE IF NOT EXISTS links(src TEXT NOT NULL, dst TEXT NOT NULL, PRIMARY KEY(src, dst));
 CREATE TABLE IF NOT EXISTS embeddings(file TEXT NOT NULL, idx INTEGER NOT NULL, vector BLOB NOT NULL, PRIMARY KEY(file, idx));
+CREATE TABLE IF NOT EXISTS metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(text, file UNINDEXED, idx UNINDEXED, tokenize='trigram');
 `
 
@@ -83,6 +84,9 @@ func Open(path string) (*Index, error) {
 	if err != nil {
 		return nil, err
 	}
+	// modernc 的 PRAGMA 是连接级状态；单连接确保 WAL/busy_timeout
+	// 覆盖本 Index 的所有后续操作，也避免写入互相覆盖。
+	db.SetMaxOpenConns(1)
 	for _, pragma := range []string{
 		"PRAGMA journal_mode=WAL",
 		"PRAGMA busy_timeout=5000",

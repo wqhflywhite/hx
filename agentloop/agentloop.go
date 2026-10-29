@@ -53,17 +53,20 @@ func (l *Loop) Create(c *fiber.Context, opts agent.Options) (agent.Agent, error)
 		store:    store,
 		fiber:    fb,
 		inbox:    make(chan string, 16),
+		runDone:  make(chan struct{}),
 		maxSteps: l.maxSteps,
 	}
-	// 日志文件是 agent fiber 拥有的副作用（effect）。
+	// Dispose 先关闭 fiber.Done 取消 turn，并等待 run 退出后才关闭日志。
 	if err := fb.Context().Effect(func(*fiber.Context) (fiber.Disposer, error) {
 		return func() error {
+			<-a.runDone
 			if closer, ok := store.(interface{ Close() error }); ok {
 				return closer.Close()
 			}
 			return nil
 		}, nil
 	}); err != nil {
+		close(a.runDone)
 		_ = fb.Dispose()
 		return nil, err
 	}
@@ -78,6 +81,7 @@ type loopAgent struct {
 	store    session.Store
 	fiber    *fiber.Fiber
 	inbox    chan string
+	runDone  chan struct{}
 	maxSteps int
 }
 
@@ -97,6 +101,7 @@ func (a *loopAgent) Dispose() error { return a.fiber.Dispose() }
 
 // run 循环领取 inbox 输入，直到 fiber 被 dispose（撤销）。
 func (a *loopAgent) run() {
+	defer close(a.runDone)
 	for {
 		select {
 		case <-a.fiber.Done():
@@ -165,7 +170,7 @@ func (a *loopAgent) turn(text string) {
 					stepErr = err
 					break
 				}
-				res := reg.Execute(c, call)
+				res := reg.Execute(ctx, c, call)
 				if err := a.append(c, session.ToolResult, session.ToolResultData{CallID: call.ID, Name: call.Name, Content: res.Content, Error: res.Error}); err != nil {
 					return
 				}
@@ -224,8 +229,8 @@ func (a *loopAgent) step(ctx context.Context) ([]llm.ToolCall, error) {
 	messages := append([]llm.Message{{Role: "system", Content: system}}, history...)
 
 	req := &llm.Request{Messages: messages, Tools: schemas}
-	req, err = event.Waterfall[*llm.Request, *llm.Request](c, "agent/pre-step", req,
-		func(_ *fiber.Context, in *llm.Request) (*llm.Request, error) { return in, nil })
+	req, err = event.Waterfall[*llm.Request, *llm.Request](c, ctx, "agent/pre-step", req,
+		func(_ context.Context, _ *fiber.Context, in *llm.Request) (*llm.Request, error) { return in, nil })
 	if err != nil {
 		return nil, err
 	}
@@ -251,6 +256,9 @@ func (a *loopAgent) step(ctx context.Context) ([]llm.ToolCall, error) {
 		if chunk.ToolCall != nil {
 			calls = append(calls, *chunk.ToolCall)
 		}
+	}
+	if streamErr != nil {
+		calls = nil
 	}
 	if err := a.append(c, session.AssistantMessage, session.AssistantMessageData{Content: string(content), ToolCalls: calls}); err != nil {
 		return nil, err

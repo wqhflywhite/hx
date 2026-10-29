@@ -2,6 +2,7 @@
 package event
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"reflect"
@@ -80,6 +81,7 @@ func addListener(c *fiber.Context, name string, fn any) fiber.Disposer {
 	})
 	// 把清理绑定到 fiber 生命周期，保证 Dispose 后不残留任何监听器。
 	if err := c.Effect(func(*fiber.Context) (fiber.Disposer, error) { return d, nil }); err != nil {
+		_ = d()
 		panic(fmt.Errorf("event: register listener on %q: %w", name, err))
 	}
 	return d
@@ -188,18 +190,18 @@ func Serial[P, R any](c *fiber.Context, name string, p P) (R, bool) {
 }
 
 // Next 是在瀑布（waterfall）链中传递的延续函数。
-type Next[I, O any] func(*fiber.Context, I) (O, error)
+type Next[I, O any] func(context.Context, *fiber.Context, I) (O, error)
 
 // OnWaterfall 把 mw 作为洋葱模型中间件订阅到 name；不调用 next 的
 // 中间件会按设计短路整条链。
-func OnWaterfall[I, O any](c *fiber.Context, name string, mw func(*fiber.Context, I, Next[I, O]) (O, error)) fiber.Disposer {
+func OnWaterfall[I, O any](c *fiber.Context, name string, mw func(context.Context, *fiber.Context, I, Next[I, O]) (O, error)) fiber.Disposer {
 	checkSig(name, sig{kind: kindWaterfall, payload: reflect.TypeFor[I](), result: reflect.TypeFor[O]()})
 	return addListener(c, name, mw)
 }
 
 // Waterfall 让 in 依次穿过 name 的洋葱链，最外层先执行（按注册
-// 顺序），最终在 terminal 收尾。
-func Waterfall[I, O any](c *fiber.Context, name string, in I, terminal Next[I, O]) (O, error) {
+// 顺序），最终在 terminal 收尾。ctx 原样穿过所有监听器与 terminal。
+func Waterfall[I, O any](c *fiber.Context, ctx context.Context, name string, in I, terminal Next[I, O]) (O, error) {
 	mu.RLock()
 	s, ok := sigs[name]
 	mu.RUnlock()
@@ -211,9 +213,11 @@ func Waterfall[I, O any](c *fiber.Context, name string, in I, terminal Next[I, O
 	ls := collect(c, name)
 	next := terminal
 	for i := len(ls) - 1; i >= 0; i-- {
-		mw := ls[i].fn.(func(*fiber.Context, I, Next[I, O]) (O, error))
+		mw := ls[i].fn.(func(context.Context, *fiber.Context, I, Next[I, O]) (O, error))
 		inner := next
-		next = func(cc *fiber.Context, v I) (O, error) { return mw(cc, v, inner) }
+		next = func(callCtx context.Context, cc *fiber.Context, v I) (O, error) {
+			return mw(callCtx, cc, v, inner)
+		}
 	}
-	return next(c, in)
+	return next(ctx, c, in)
 }

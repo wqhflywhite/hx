@@ -11,6 +11,7 @@ import (
 	"iter"
 	"net/http"
 	"os"
+	"sort"
 	"strings"
 
 	"hx/core/fiber"
@@ -116,6 +117,9 @@ type toolDefinition struct {
 }
 
 type streamResponse struct {
+	Error *struct {
+		Message string `json:"message"`
+	} `json:"error,omitempty"`
 	Choices []struct {
 		Delta struct {
 			Content   string `json:"content"`
@@ -224,11 +228,17 @@ func (a *toolCallAccumulator) add(index int, id, name, args string) {
 	a.args[index].WriteString(args)
 }
 
-// flush 按 index 顺序产出完整调用，并重置下一组调用的累积状态。
+// flush 按实际 index 排序产出完整调用，稀疏或非连续 index 不会
+// 触发 nil 解引用；随后重置下一组调用的累积状态。
 func (a *toolCallAccumulator) flush(yield func(llm.Chunk) bool) bool {
-	for i := 0; i < len(a.pending); i++ {
-		call := a.pending[i]
-		call.Arguments = a.args[i].String()
+	indices := make([]int, 0, len(a.pending))
+	for index := range a.pending {
+		indices = append(indices, index)
+	}
+	sort.Ints(indices)
+	for _, index := range indices {
+		call := a.pending[index]
+		call.Arguments = a.args[index].String()
 		if !yield(llm.Chunk{ToolCall: call}) {
 			return false
 		}
@@ -239,6 +249,8 @@ func (a *toolCallAccumulator) flush(yield func(llm.Chunk) bool) bool {
 }
 
 // consumeStream 逐行消费 SSE，输出文本、usage 和完整工具调用。
+// 只有显式 [DONE] 是正常终态；取消、扫描错误和缺失 DONE 的 EOF
+// 都必须向上层报告，不能把半截响应当成成功。
 func consumeStream(ctx context.Context, body io.Reader, yield func(llm.Chunk) bool) {
 	calls := newToolCallAccumulator()
 	scanner := bufio.NewScanner(body)
@@ -262,6 +274,10 @@ func consumeStream(ctx context.Context, body io.Reader, yield func(llm.Chunk) bo
 			yield(llm.Chunk{Err: fmt.Errorf("deepseek: bad SSE data: %w", err)})
 			return
 		}
+		if sr.Error != nil {
+			yield(llm.Chunk{Err: fmt.Errorf("deepseek: SSE error: %s", sr.Error.Message)})
+			return
+		}
 		if sr.Usage != nil {
 			if !yield(llm.Chunk{Usage: sr.Usage}) {
 				return
@@ -283,9 +299,15 @@ func consumeStream(ctx context.Context, body io.Reader, yield func(llm.Chunk) bo
 			}
 		}
 	}
-	if err := scanner.Err(); err != nil && ctx.Err() == nil {
-		yield(llm.Chunk{Err: err})
+	if err := scanner.Err(); err != nil {
+		yield(llm.Chunk{Err: fmt.Errorf("deepseek: read SSE: %w", err)})
+		return
 	}
+	if err := ctx.Err(); err != nil {
+		yield(llm.Chunk{Err: err})
+		return
+	}
+	yield(llm.Chunk{Err: io.ErrUnexpectedEOF})
 }
 
 // Plugin 把 DeepSeek 适配器注册进 "llm" 注册表，名字取自

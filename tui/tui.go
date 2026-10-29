@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"sync"
@@ -35,14 +36,23 @@ type askReq struct {
 
 // Confirm 实现 approval.Prompter：它阻塞调用方的 agent 协程，
 // 直到用户在 TUI 内作答或 UI 关闭。
-func (p *Prompter) Confirm(_ *fiber.Context, call llm.ToolCall) (bool, error) {
+func (p *Prompter) Confirm(ctx context.Context, _ *fiber.Context, call llm.ToolCall) (bool, error) {
 	r := askReq{call: call, ans: make(chan bool, 1)}
 	select {
 	case p.reqs <- r:
 	case <-p.done:
 		return false, nil
+	case <-ctx.Done():
+		return false, ctx.Err()
 	}
-	return <-r.ans, nil
+	select {
+	case allow := <-r.ans:
+		return allow, nil
+	case <-p.done:
+		return false, nil
+	case <-ctx.Done():
+		return false, ctx.Err()
+	}
 }
 
 // close 释放仍在等待的 Confirm 调用方；幂等。

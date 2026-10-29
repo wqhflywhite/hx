@@ -256,7 +256,7 @@ func TestTools(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	res := reg.Execute(ctx, llm.ToolCall{Name: "kb_search", Arguments: `{"query":"静态类型"}`})
+	res := reg.Execute(context.Background(), ctx, llm.ToolCall{Name: "kb_search", Arguments: `{"query":"静态类型"}`})
 	if res.Error != "" {
 		t.Fatalf("kb_search failed: %s", res.Error)
 	}
@@ -264,7 +264,7 @@ func TestTools(t *testing.T) {
 		t.Fatalf("kb_search = %q", res.Content)
 	}
 
-	res = reg.Execute(ctx, llm.ToolCall{Name: "kb_read", Arguments: `{"path":"note.md","heading":["Go"]}`})
+	res = reg.Execute(context.Background(), ctx, llm.ToolCall{Name: "kb_read", Arguments: `{"path":"note.md","heading":["Go"]}`})
 	if res.Error != "" {
 		t.Fatalf("kb_read failed: %s", res.Error)
 	}
@@ -280,7 +280,7 @@ func TestTools(t *testing.T) {
 		t.Fatalf("etag parse failed: %d %v", n, err)
 	}
 	args, _ := json.Marshal(map[string]any{"path": "note.md", "content": "# Go\n\nGo 是静态类型语言，并发是头等公民。\n", "sha1": sha1, "mtime": mtime})
-	res = reg.Execute(ctx, llm.ToolCall{Name: "kb_write", Arguments: string(args)})
+	res = reg.Execute(context.Background(), ctx, llm.ToolCall{Name: "kb_write", Arguments: string(args)})
 	if res.Error != "" {
 		t.Fatalf("kb_write failed: %s", res.Error)
 	}
@@ -288,7 +288,7 @@ func TestTools(t *testing.T) {
 		t.Fatalf("kb_write = %q", res.Content)
 	}
 
-	res = reg.Execute(ctx, llm.ToolCall{Name: "kb_search", Arguments: `{"query":"头等公民"}`})
+	res = reg.Execute(context.Background(), ctx, llm.ToolCall{Name: "kb_search", Arguments: `{"query":"头等公民"}`})
 	if res.Error != "" || !strings.Contains(res.Content, "note.md") {
 		t.Fatalf("written content not searchable: %q / %s", res.Content, res.Error)
 	}
@@ -546,11 +546,11 @@ func TestLint(t *testing.T) {
 func TestLintTool(t *testing.T) {
 	_, svc, reg, vaultDir := mount(t, nil)
 
-	res := reg.Execute(fiber.New().Context(), llm.ToolCall{Name: "kb_lint", Arguments: `{}`})
+	res := reg.Execute(context.Background(), fiber.New().Context(), llm.ToolCall{Name: "kb_lint", Arguments: `{}`})
 	if res.Error != "" || !strings.Contains(res.Content, "vault healthy") {
 		t.Fatalf("empty vault: %q / %s", res.Content, res.Error)
 	}
-	res = reg.Execute(fiber.New().Context(), llm.ToolCall{Name: "kb_lint", Arguments: `{"bogus": 1}`})
+	res = reg.Execute(context.Background(), fiber.New().Context(), llm.ToolCall{Name: "kb_lint", Arguments: `{"bogus": 1}`})
 	if res.Error == "" {
 		t.Fatal("kb_lint accepted arguments")
 	}
@@ -561,7 +561,7 @@ func TestLintTool(t *testing.T) {
 	}
 	ctx := fiber.New().Context()
 	defer func() { _ = ctx.Fiber().Dispose() }()
-	res = reg.Execute(ctx, llm.ToolCall{Name: "kb_lint", Arguments: `{}`})
+	res = reg.Execute(context.Background(), ctx, llm.ToolCall{Name: "kb_lint", Arguments: `{}`})
 	if res.Error != "" {
 		t.Fatalf("kb_lint failed: %s", res.Error)
 	}

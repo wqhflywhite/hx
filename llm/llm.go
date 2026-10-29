@@ -76,27 +76,34 @@ type Registry struct {
 // NewRegistry 创建一个空注册表。
 func NewRegistry() *Registry { return &Registry{adapters: map[string]Adapter{}} }
 
-// SetAdapter 以 name 安装 a 并返回卸载它的卸载器（disposer）；
-// name 重复时 panic。
+// SetAdapter 以 name 安装 a 并返回卸载器；同名适配器被替换，
+// disposer 只回滚自己这一代的注册，不误删后续实例。
 func (r *Registry) SetAdapter(name string, a Adapter) fiber.Disposer {
 	r.mu.Lock()
-	if _, ok := r.adapters[name]; ok {
-		r.mu.Unlock()
-		panic(fmt.Errorf("llm: adapter %q already registered", name))
-	}
+	pre, exist := r.adapters[name]
 	r.adapters[name] = a
-	r.order = append(r.order, name)
+	if !exist {
+		r.order = append(r.order, name)
+	}
 	r.mu.Unlock()
 	return func() error {
 		r.mu.Lock()
 		defer r.mu.Unlock()
-		if r.adapters[name] == a {
-			delete(r.adapters, name)
-			for i, n := range r.order {
-				if n == name {
-					r.order = append(r.order[:i], r.order[i+1:]...)
-					break
-				}
+
+		cur, ok := r.adapters[name]
+		if !ok || cur != a {
+			return nil
+		}
+		if exist {
+			r.adapters[name] = pre
+			return nil
+		}
+
+		delete(r.adapters, name)
+		for i, n := range r.order {
+			if n == name {
+				r.order = append(r.order[:i], r.order[i+1:]...)
+				break
 			}
 		}
 		return nil
@@ -151,8 +158,8 @@ func (r *Registry) Adapter(name string) (Adapter, bool) {
 // llm/stream 瀑布（waterfall）执行请求，重试、日志与计量以
 // 监听器形式挂入。
 func Stream(c *fiber.Context, ctx context.Context, req *Request) (iter.Seq[Chunk], error) {
-	return event.Waterfall[*Request, iter.Seq[Chunk]](c, "llm/stream", req,
-		func(c *fiber.Context, r *Request) (iter.Seq[Chunk], error) {
+	return event.Waterfall[*Request, iter.Seq[Chunk]](c, ctx, "llm/stream", req,
+		func(ctx context.Context, c *fiber.Context, r *Request) (iter.Seq[Chunk], error) {
 			reg, ok := fiber.Get[*Registry](c, "llm")
 			if !ok {
 				return nil, errNoAdapter

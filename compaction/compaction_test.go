@@ -35,6 +35,7 @@ type fakeAdapter struct {
 	mu        sync.Mutex
 	startOnce sync.Once
 	response  string
+	err       error
 	reqs      []*llm.Request
 	started   chan struct{}
 	release   chan struct{}
@@ -52,6 +53,10 @@ func (f *fakeAdapter) Stream(_ context.Context, req *llm.Request) iter.Seq[llm.C
 	}
 	response := f.response
 	return func(yield func(llm.Chunk) bool) {
+		if f.err != nil {
+			yield(llm.Chunk{Err: f.err})
+			return
+		}
 		yield(llm.Chunk{Delta: response})
 	}
 }
@@ -760,7 +765,7 @@ func (bigTool) Name() string { return "big_tool" }
 func (bigTool) Schema() map[string]any {
 	return map[string]any{"description": "test double", "type": "object"}
 }
-func (bigTool) Execute(_ *fiber.Context, _ json.RawMessage) (any, error) {
+func (bigTool) Execute(_ context.Context, _ *fiber.Context, _ json.RawMessage) (any, error) {
 	return strings.Repeat("x", 400), nil
 }
 

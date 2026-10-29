@@ -1,6 +1,7 @@
 package subagent_test
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -512,7 +513,7 @@ func TestDelegateRevokedByFiberDispose(t *testing.T) {
 	}
 	resultCh := make(chan outcome, 1)
 	go func() {
-		val, err := tool.Execute(fb.Context(), json.RawMessage(`{"task":"slow subtask"}`))
+		val, err := tool.Execute(context.Background(), fb.Context(), json.RawMessage(`{"task":"slow subtask"}`))
 		resultCh <- outcome{val, err}
 	}()
 

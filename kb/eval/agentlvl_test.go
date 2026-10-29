@@ -1,6 +1,7 @@
 package eval_test
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"iter"
@@ -153,8 +154,8 @@ func TestRealVaultAgentLevel(t *testing.T) {
 	col := &agentlvlCollector{}
 	// llm/stream 瀑布（waterfall）上的计量中间件：把 usage chunk 从流里
 	// 旁路复制出来（agentloop 自身不记录它们）。
-	event.OnWaterfall(ctx, "llm/stream", func(c *fiber.Context, req *llm.Request, next event.Next[*llm.Request, iter.Seq[llm.Chunk]]) (iter.Seq[llm.Chunk], error) {
-		seq, err := next(c, req)
+	event.OnWaterfall(ctx, "llm/stream", func(ctx context.Context, c *fiber.Context, req *llm.Request, next event.Next[*llm.Request, iter.Seq[llm.Chunk]]) (iter.Seq[llm.Chunk], error) {
+		seq, err := next(ctx, c, req)
 		if err != nil {
 			return nil, err
 		}

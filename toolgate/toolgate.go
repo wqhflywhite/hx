@@ -3,6 +3,7 @@
 package toolgate
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"slices"
@@ -53,28 +54,43 @@ func sessionKey(f *fiber.Fiber) *fiber.Fiber {
 	return root
 }
 
-// activatedLocked 返回 key 的激活列表副本，首次见到 key 时建条目
-// 并在该 fiber 上登记清理，让会话撤销后状态不残留；fiber 已
-// dispose 时条目保留到插件卸载。
-func (g *gate) activatedLocked(key *fiber.Fiber) []string {
+// activated 返回 key 的激活列表副本。首次见到 key 时在锁外登记
+// 清理，避免 fiber Dispose 同步执行清理器时与 g.mu 自死锁；
+// 已撤销的会话不再发布新条目。
+func (g *gate) activated(key *fiber.Fiber) ([]string, bool) {
+	g.mu.Lock()
 	names, ok := g.active[key]
+	g.mu.Unlock()
+	if ok {
+		return append([]string(nil), names...), true
+	}
+	if err := key.Context().Effect(func(*fiber.Context) (fiber.Disposer, error) {
+		return func() error {
+			g.mu.Lock()
+			defer g.mu.Unlock()
+			delete(g.active, key)
+			return nil
+		}, nil
+	}); err != nil {
+		return nil, false
+	}
+	g.mu.Lock()
+	names, ok = g.active[key]
 	if !ok {
 		g.active[key] = nil
-		_ = key.Context().Effect(func(*fiber.Context) (fiber.Disposer, error) {
-			return func() error {
-				g.mu.Lock()
-				defer g.mu.Unlock()
-				delete(g.active, key)
-				return nil
-			}, nil
-		})
 	}
-	return append([]string(nil), names...)
+	g.mu.Unlock()
+	return append([]string(nil), names...), true
 }
 
-// activateLocked 把 names 按序并入 key 的激活集合（已激活的不重复）。
-func (g *gate) activateLocked(key *fiber.Fiber, names []string) {
-	cur := g.activatedLocked(key)
+// activate 把 names 按序并入 key 的激活集合（已激活的不重复）。
+func (g *gate) activate(key *fiber.Fiber, names []string) {
+	if _, ok := g.activated(key); !ok {
+		return
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	cur := g.active[key]
 	for _, n := range names {
 		if !slices.Contains(cur, n) {
 			cur = append(cur, n)
@@ -88,9 +104,9 @@ func (g *gate) activateLocked(key *fiber.Fiber, names []string) {
 // 自身与该会话已激活的工具。基础集合保持 Schemas() 的名字序，
 // 激活工具按激活先后追加在尾部，且会话内集合只增不减，保证同一
 // 会话相邻两次组装间前缀稳定（KV cache 友好）。
-func (g *gate) filter(c *fiber.Context, in []llm.ToolSchema, next event.Next[[]llm.ToolSchema, []llm.ToolSchema]) ([]llm.ToolSchema, error) {
+func (g *gate) filter(ctx context.Context, c *fiber.Context, in []llm.ToolSchema, next event.Next[[]llm.ToolSchema, []llm.ToolSchema]) ([]llm.ToolSchema, error) {
 	if len(in) <= g.maxInline {
-		return next(c, in)
+		return next(ctx, c, in)
 	}
 	byName := make(map[string]llm.ToolSchema, len(in))
 	out := make([]llm.ToolSchema, 0, len(in))
@@ -100,15 +116,13 @@ func (g *gate) filter(c *fiber.Context, in []llm.ToolSchema, next event.Next[[]l
 			out = append(out, s)
 		}
 	}
-	g.mu.Lock()
-	activated := g.activatedLocked(sessionKey(c.Fiber()))
-	g.mu.Unlock()
+	activated, _ := g.activated(sessionKey(c.Fiber()))
 	for _, name := range activated {
 		if s, ok := byName[name]; ok && name != searchToolName && !g.always[name] {
 			out = append(out, s)
 		}
 	}
-	return next(c, out)
+	return next(ctx, c, out)
 }
 
 // search 对注册表全部工具按 query 打分并取前 limit 个：大小写
@@ -182,7 +196,7 @@ type searchArgs struct {
 }
 
 // Execute 实现 tools.Tool。
-func (t searchTool) Execute(c *fiber.Context, args json.RawMessage) (any, error) {
+func (t searchTool) Execute(_ context.Context, c *fiber.Context, args json.RawMessage) (any, error) {
 	var a searchArgs
 	if err := json.Unmarshal(args, &a); err != nil {
 		return nil, fmt.Errorf("tool_search: bad arguments: %w", err)
@@ -196,9 +210,7 @@ func (t searchTool) Execute(c *fiber.Context, args json.RawMessage) (any, error)
 		names = append(names, s.Name)
 	}
 	g := t.gate
-	g.mu.Lock()
-	g.activateLocked(sessionKey(c.Fiber()), names)
-	g.mu.Unlock()
+	g.activate(sessionKey(c.Fiber()), names)
 	raw, err := json.Marshal(matches)
 	if err != nil {
 		return nil, err

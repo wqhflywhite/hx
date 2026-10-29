@@ -296,7 +296,7 @@ func TestApprovalRoundTrip(t *testing.T) {
 	}
 	done := make(chan outcome, 1)
 	go func() {
-		allow, err := prompter.Confirm(nil, call)
+		allow, err := prompter.Confirm(context.Background(), nil, call)
 		done <- outcome{allow, err}
 	}()
 
@@ -332,7 +332,7 @@ func TestApprovalBackfillForLateJoin(t *testing.T) {
 	done := make(chan struct{})
 	defer close(done)
 	go func() {
-		_, _ = prompter.Confirm(nil, llm.ToolCall{ID: "c1", Name: "edit", Arguments: "{}"})
+		_, _ = prompter.Confirm(context.Background(), nil, llm.ToolCall{ID: "c1", Name: "edit", Arguments: "{}"})
 	}()
 	// 等待提问注册完成。
 	deadline := time.Now().Add(10 * time.Second)
@@ -360,7 +360,7 @@ func TestPrompterCloseDeniesPending(t *testing.T) {
 	}
 	done := make(chan bool, 1)
 	go func() {
-		allow, _ := prompter.Confirm(nil, llm.ToolCall{Name: "bash"})
+		allow, _ := prompter.Confirm(context.Background(), nil, llm.ToolCall{Name: "bash"})
 		done <- allow
 	}()
 	deadline := time.Now().Add(10 * time.Second)
@@ -379,7 +379,7 @@ func TestPrompterCloseDeniesPending(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("Confirm did not unblock on Close")
 	}
-	if allow, err := prompter.Confirm(nil, llm.ToolCall{Name: "bash"}); err != nil || allow {
+	if allow, err := prompter.Confirm(context.Background(), nil, llm.ToolCall{Name: "bash"}); err != nil || allow {
 		t.Fatalf("Confirm after Close = (%v, %v); want (false, nil)", allow, err)
 	}
 }

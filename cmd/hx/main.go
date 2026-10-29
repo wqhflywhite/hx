@@ -5,6 +5,7 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -85,7 +86,9 @@ func main() {
 	resume := fs.String("resume", "", "resume the given session id and continue")
 	configFlag := fs.String("config", "", "path to hx.yml (default ./hx.yml, then ~/.hx/hx.yml)")
 	watch := fs.Bool("watch", false, "reload the config file on change (config mode only)")
-	addr := fs.String("addr", ":7681", "listen address for web mode")
+	addr := fs.String("addr", "127.0.0.1:7681", "listen address for web mode")
+	allowRemote := fs.Bool("allow-remote", false, "allow non-loopback web listen (requires an auth token)")
+	authToken := fs.String("auth-token", os.Getenv("HX_WEB_TOKEN"), "auth token for all web endpoints (or HX_WEB_TOKEN)")
 	_ = fs.Parse(args)
 	rest := fs.Args()
 	if mode == "" && len(rest) == 0 {
@@ -113,17 +116,11 @@ func main() {
 		defer stack.Dispose()
 	}
 
-	agents, ok := fiber.Get[*agent.Registry](agentCtx, "agents")
-	if !ok {
-		fatal(fmt.Errorf("agents service unavailable"))
-	}
 	cell := &agentCell{}
 	defer cell.swap(nil)
-	ag, err := agents.Create(agentCtx, agent.Options{SessionID: *resume})
-	if err != nil {
+	if _, err := createAgent(agentCtx, stack, cell, *resume); err != nil {
 		fatal(err)
 	}
-	cell.swap(ag)
 	fmt.Fprintf(os.Stderr, "session: %s\n", cell.sessionID())
 
 	// TUI 和 web 启动后会把 notify 改接到各自的 UI。
@@ -142,7 +139,7 @@ func main() {
 			fatal(err)
 		}
 	case "web":
-		srv := newWebServer(ctx, stack, cell, webPrompter)
+		srv := newWebServer(ctx, stack, cell, webPrompter, *authToken, *allowRemote)
 		notify = srv.Notify
 		fmt.Fprintf(os.Stderr, "hx: web UI listening on %s\n", *addr)
 		if err := srv.Run(ctx, *addr); err != nil {
@@ -194,53 +191,62 @@ func mountForMode(ctx *fiber.Context, mode, configPath string, found bool, promp
 	return nil, ctx, nil
 }
 
+// createAgent 在同一个 layer 租约内创建并发布 agent，避免 Reload
+// 已撤销旧代后，旧请求又把旧 agent 写回 cell。
+func createAgent(rootCtx *fiber.Context, stack *hxconfig.Stack, cell *agentCell, sessionID string) (string, error) {
+	id := ""
+	create := func(ctx *fiber.Context) error {
+		reg, ok := fiber.Get[*agent.Registry](ctx, "agents")
+		if !ok {
+			return fmt.Errorf("agents service unavailable")
+		}
+		ag, err := reg.Create(ctx, agent.Options{SessionID: sessionID})
+		if err != nil {
+			return err
+		}
+		cell.swap(ag)
+		id = ag.SessionID()
+		return nil
+	}
+	if stack != nil {
+		if err := stack.WithLayer(create); err != nil {
+			return "", err
+		}
+	} else if err := create(rootCtx); err != nil {
+		return "", err
+	}
+	return id, nil
+}
+
 // watchConfig 在插件层重建后，用同一会话 id 替换当前 agent。
 func watchConfig(stack *hxconfig.Stack, configPath string, cell *agentCell, notify func(string)) error {
 	return stack.Watch(configPath, func(err error) {
 		if err != nil {
-			notify("config reload failed: " + err.Error())
-			return
+			var reloadErr *hxconfig.ReloadError
+			if !errors.As(err, &reloadErr) || !reloadErr.Committed {
+				notify("config reload failed: " + err.Error())
+				return
+			}
+			notify("config reload committed with cleanup warning: " + err.Error())
 		}
-		reg, ok := fiber.Get[*agent.Registry](stack.Layer(), "agents")
-		if !ok {
-			return
-		}
-		fresh, err := reg.Create(stack.Layer(), agent.Options{SessionID: cell.sessionID()})
+		id, err := createAgent(nil, stack, cell, cell.sessionID())
 		if err != nil {
+			notify("config reload could not restart agent: " + err.Error())
 			return
 		}
-		cell.swap(fresh)
-		notify("config reloaded; agent restarted on session " + cell.sessionID())
+		notify("config reloaded; agent restarted on session " + id)
 	})
 }
 
 // newWebServer 把 web 服务器接入 harness：消息发往 cell，
 // 会话切换时在当前层上重建 agent。
-func newWebServer(ctx *fiber.Context, stack *hxconfig.Stack, cell *agentCell, prompter *web.Prompter) *web.Server {
+func newWebServer(ctx *fiber.Context, stack *hxconfig.Stack, cell *agentCell, prompter *web.Prompter, authToken string, allowRemote bool) *web.Server {
 	mgr, ok := fiber.Get[*session.Manager](ctx, "sessions")
 	if !ok {
 		fatal(fmt.Errorf("sessions service unavailable"))
 	}
-	// layerCtx 解析新 agent 创建所在的 fiber；配置热重挂会重建
-	// 该层，因此惰性解析。
-	layerCtx := func() *fiber.Context {
-		if stack != nil {
-			return stack.Layer()
-		}
-		return ctx
-	}
 	recreate := func(sessionID string) (string, error) {
-		lc := layerCtx()
-		reg, ok := fiber.Get[*agent.Registry](lc, "agents")
-		if !ok {
-			return "", fmt.Errorf("agents service unavailable")
-		}
-		ag, err := reg.Create(lc, agent.Options{SessionID: sessionID})
-		if err != nil {
-			return "", err
-		}
-		cell.swap(ag)
-		return cell.sessionID(), nil
+		return createAgent(ctx, stack, cell, sessionID)
 	}
 	srv, err := web.NewServer(web.Options{
 		Prompter:       prompter,
@@ -250,6 +256,8 @@ func newWebServer(ctx *fiber.Context, stack *hxconfig.Stack, cell *agentCell, pr
 		ListSessions:   mgr.List,
 		NewSession:     func() (string, error) { return recreate("") },
 		ResumeSession:  recreate,
+		AuthToken:      authToken,
+		AllowRemote:    allowRemote,
 	})
 	if err != nil {
 		fatal(err)

@@ -40,7 +40,7 @@ type searchArgs struct {
 }
 
 // Execute 实现 tools.Tool。
-func (t searchTool) Execute(c *fiber.Context, args json.RawMessage) (any, error) {
+func (t searchTool) Execute(ctx context.Context, c *fiber.Context, args json.RawMessage) (any, error) {
 	var a searchArgs
 	if err := json.Unmarshal(args, &a); err != nil {
 		return nil, fmt.Errorf("kb_search: bad arguments: %w", err)
@@ -48,7 +48,7 @@ func (t searchTool) Execute(c *fiber.Context, args json.RawMessage) (any, error)
 	if strings.TrimSpace(a.Query) == "" {
 		return nil, fmt.Errorf("kb_search: empty query")
 	}
-	hits, err := t.svc.Search(context.Background(), a.Query, index.SearchOpts{Limit: a.Limit})
+	hits, err := t.svc.Search(ctx, a.Query, index.SearchOpts{Limit: a.Limit})
 	if err != nil {
 		return nil, err
 	}
@@ -98,12 +98,12 @@ type readArgs struct {
 }
 
 // Execute 实现 tools.Tool。
-func (t readTool) Execute(c *fiber.Context, args json.RawMessage) (any, error) {
+func (t readTool) Execute(ctx context.Context, c *fiber.Context, args json.RawMessage) (any, error) {
 	var a readArgs
 	if err := json.Unmarshal(args, &a); err != nil {
 		return nil, fmt.Errorf("kb_read: bad arguments: %w", err)
 	}
-	content, etag, err := t.svc.Read(context.Background(), a.Path, a.Heading)
+	content, etag, err := t.svc.Read(ctx, a.Path, a.Heading)
 	if err != nil {
 		return nil, err
 	}
@@ -143,13 +143,13 @@ type writeArgs struct {
 }
 
 // Execute 实现 tools.Tool。
-func (t writeTool) Execute(c *fiber.Context, args json.RawMessage) (any, error) {
+func (t writeTool) Execute(ctx context.Context, c *fiber.Context, args json.RawMessage) (any, error) {
 	var a writeArgs
 	if err := json.Unmarshal(args, &a); err != nil {
 		return nil, fmt.Errorf("kb_write: bad arguments: %w", err)
 	}
 	etag := ETag{SHA1: a.SHA1, MTime: timeFromNanos(a.MTime)}
-	fresh, err := t.svc.Write(context.Background(), a.Path, []byte(a.Content), etag)
+	fresh, err := t.svc.Write(ctx, a.Path, []byte(a.Content), etag)
 	if err != nil {
 		return nil, err
 	}
@@ -176,11 +176,11 @@ func (lintTool) Schema() map[string]any {
 }
 
 // Execute 实现 tools.Tool。
-func (t lintTool) Execute(_ *fiber.Context, args json.RawMessage) (any, error) {
+func (t lintTool) Execute(ctx context.Context, _ *fiber.Context, args json.RawMessage) (any, error) {
 	if len(args) > 0 && string(args) != "{}" && string(args) != "null" {
 		return nil, fmt.Errorf("kb_lint: takes no arguments")
 	}
-	report, err := t.svc.Lint(context.Background())
+	report, err := t.svc.Lint(ctx)
 	if err != nil {
 		return nil, err
 	}

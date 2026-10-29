@@ -2,6 +2,7 @@
 package tools
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"sort"
@@ -17,7 +18,7 @@ import (
 type Tool interface {
 	Name() string
 	Schema() map[string]any
-	Execute(c *fiber.Context, args json.RawMessage) (any, error)
+	Execute(ctx context.Context, c *fiber.Context, args json.RawMessage) (any, error)
 }
 
 // Result 是一次执行的规范化结果，可被
@@ -90,9 +91,12 @@ func (r *Registry) Schemas() []llm.ToolSchema {
 // Execute 让一次工具调用走完整流水线：tools/pre-execute 可以改写或
 // 拒绝这次调用，然后执行工具，最后 tools/post-execute 可以改写结果。
 // 会话日志记录由调用方负责。
-func (r *Registry) Execute(c *fiber.Context, call llm.ToolCall) Result {
-	call, err := event.Waterfall[llm.ToolCall, llm.ToolCall](c, "tools/pre-execute", call,
-		func(_ *fiber.Context, in llm.ToolCall) (llm.ToolCall, error) { return in, nil })
+func (r *Registry) Execute(ctx context.Context, c *fiber.Context, call llm.ToolCall) Result {
+	if err := ctx.Err(); err != nil {
+		return Result{Error: err.Error(), Content: err.Error()}
+	}
+	call, err := event.Waterfall[llm.ToolCall, llm.ToolCall](c, ctx, "tools/pre-execute", call,
+		func(_ context.Context, _ *fiber.Context, in llm.ToolCall) (llm.ToolCall, error) { return in, nil })
 	if err != nil {
 		return Result{Error: err.Error(), Content: err.Error()}
 	}
@@ -102,7 +106,7 @@ func (r *Registry) Execute(c *fiber.Context, call llm.ToolCall) Result {
 		res.Content = res.Error
 		return res
 	}
-	value, err := tool.Execute(c, json.RawMessage(call.Arguments))
+	value, err := tool.Execute(ctx, c, json.RawMessage(call.Arguments))
 	res := Result{}
 	if err != nil {
 		res.Error = err.Error()
@@ -118,8 +122,8 @@ func (r *Registry) Execute(c *fiber.Context, call llm.ToolCall) Result {
 			res.Content = string(raw)
 		}
 	}
-	final, err := event.Waterfall[*Result, *Result](c, "tools/post-execute", &res,
-		func(_ *fiber.Context, in *Result) (*Result, error) { return in, nil })
+	final, err := event.Waterfall[*Result, *Result](c, ctx, "tools/post-execute", &res,
+		func(_ context.Context, _ *fiber.Context, in *Result) (*Result, error) { return in, nil })
 	if err != nil {
 		return Result{Error: err.Error(), Content: err.Error()}
 	}

@@ -60,6 +60,11 @@ func New(cfg Config, client *http.Client) (*Provider, error) {
 	return &Provider{cfg: resolved, client: client}, nil
 }
 
+// Fingerprint 标识产生向量的 provider 端点与模型。
+func (p *Provider) Fingerprint() string {
+	return "openai:" + p.cfg.BaseURL + "/" + p.cfg.Model
+}
+
 type embedRequest struct {
 	Model string   `json:"model"`
 	Input []string `json:"input"`

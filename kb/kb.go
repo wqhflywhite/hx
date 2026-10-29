@@ -6,11 +6,14 @@ package kb
 import (
 	"context"
 	"crypto/sha1"
+	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"hx/kb/embed"
@@ -52,6 +55,8 @@ type Service struct {
 	vecWeight     *float64
 	searchLimit   int
 	lintMaxChunks int
+	writeMu       sync.Mutex
+	syncMu        sync.Mutex
 }
 
 // NewService 把 root 处的 vault 绑定到 idx。emb 可以为 nil（纯
@@ -83,17 +88,28 @@ func (s *Service) relative(abs string) (string, error) {
 	return filepath.ToSlash(rel), nil
 }
 
-// etagOf 计算 abs 处文件的 ETag。
+// readFileETag 从同一打开句柄读取内容与元数据，SHA-1 始终对应
+// 返回的这份字节，避免路径第二次打开时混入另一代文件。
+func readFileETag(abs string) ([]byte, ETag, error) {
+	f, err := os.Open(abs)
+	if err != nil {
+		return nil, ETag{}, err
+	}
+	defer f.Close()
+	data, err := io.ReadAll(f)
+	if err != nil {
+		return nil, ETag{}, err
+	}
+	info, err := f.Stat()
+	if err != nil {
+		return nil, ETag{}, err
+	}
+	return data, ETag{SHA1: fmt.Sprintf("%x", sha1.Sum(data)), MTime: info.ModTime()}, nil
+}
+
 func etagOf(abs string) (ETag, error) {
-	data, err := os.ReadFile(abs)
-	if err != nil {
-		return ETag{}, err
-	}
-	info, err := os.Stat(abs)
-	if err != nil {
-		return ETag{}, err
-	}
-	return ETag{SHA1: fmt.Sprintf("%x", sha1.Sum(data)), MTime: info.ModTime()}, nil
+	_, etag, err := readFileETag(abs)
+	return etag, err
 }
 
 // Search 实现 KB。配置了 embedder 时，查询会转成嵌入向量，
@@ -115,6 +131,18 @@ func (s *Service) Search(ctx context.Context, query string, opts index.SearchOpt
 			return nil, fmt.Errorf("kb: embed query: %w", err)
 		}
 		if len(vecs) == 1 {
+			changed, err := s.idx.EmbeddingChanged(s.fingerprint(), len(vecs[0]))
+			if err != nil {
+				return nil, err
+			}
+			if changed {
+				if err := s.idx.ResetEmbedding(s.fingerprint(), len(vecs[0])); err != nil {
+					return nil, err
+				}
+				if err := s.Sync(); err != nil {
+					return nil, err
+				}
+			}
 			opts.Vector = vecs[0]
 		}
 	}
@@ -127,13 +155,9 @@ func (s *Service) Read(_ context.Context, path string, heading []string) (string
 	if err != nil {
 		return "", ETag{}, err
 	}
-	data, err := os.ReadFile(abs)
+	data, etag, err := readFileETag(abs)
 	if err != nil {
 		return "", ETag{}, fmt.Errorf("kb: read %q: %w", path, err)
-	}
-	etag, err := etagOf(abs)
-	if err != nil {
-		return "", ETag{}, err
 	}
 	if len(heading) == 0 {
 		return string(data), etag, nil
@@ -177,6 +201,8 @@ func conflictError(path string) error {
 // 先重新索引再返回，所以下一次检索
 // 就能看到它。
 func (s *Service) Write(_ context.Context, path string, content []byte, etag ETag) (ETag, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	abs, err := s.resolve(path)
 	if err != nil {
 		return ETag{}, err
@@ -194,14 +220,36 @@ func (s *Service) Write(_ context.Context, path string, content []byte, etag ETa
 			return ETag{}, conflictError(path)
 		}
 	}
-	if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
+	dir := filepath.Dir(abs)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return ETag{}, err
 	}
-	if err := os.WriteFile(abs, content, 0o644); err != nil {
+	tmp, err := os.CreateTemp(dir, ".hx-write-*")
+	if err != nil {
+		return ETag{}, err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if _, err := tmp.Write(content); err != nil {
+		_ = tmp.Close()
+		return ETag{}, err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return ETag{}, err
+	}
+	if err := tmp.Chmod(0o644); err != nil {
+		_ = tmp.Close()
+		return ETag{}, err
+	}
+	if err := tmp.Close(); err != nil {
+		return ETag{}, err
+	}
+	if err := os.Rename(tmpName, abs); err != nil {
 		return ETag{}, err
 	}
 	if err := s.SyncFile(abs); err != nil {
-		return ETag{}, err
+		return ETag{}, fmt.Errorf("kb: file %q was written, but index update failed; retry sync: %w", path, err)
 	}
 	return etagOf(abs)
 }
@@ -211,10 +259,52 @@ func (s *Service) Backlinks(_ context.Context, target string) ([]string, error) 
 	return s.idx.Backlinks(target)
 }
 
-// Sync 对整个 vault 做增量索引：有变化或新增的笔记重新索引，
-// 磁盘上已消失的笔记从索引中清除。它是启动时的一遍扫描，
-// 也是 watcher 漏事件之后的自愈路径。
+type embeddingChange struct{ dimension int }
+
+func (e *embeddingChange) Error() string { return "kb: embedding space changed" }
+
+func (s *Service) fingerprint() string {
+	if s.emb == nil {
+		return ""
+	}
+	return embed.Fingerprint(s.emb)
+}
+
+func (s *Service) expectedDimension() int {
+	if sized, ok := s.emb.(interface{ Dimension() int }); ok {
+		return sized.Dimension()
+	}
+	return 0
+}
+
+// Sync 对整个 vault 做增量索引；嵌入空间变化时先清空派生索引并
+// 从 Markdown 事实源全量重建，绝不混用两个向量空间。
 func (s *Service) Sync() error {
+	s.syncMu.Lock()
+	defer s.syncMu.Unlock()
+	for range 2 {
+		changed, err := s.idx.EmbeddingChanged(s.fingerprint(), s.expectedDimension())
+		if err != nil {
+			return err
+		}
+		if changed {
+			if err := s.idx.ResetEmbedding(s.fingerprint(), 0); err != nil {
+				return err
+			}
+		}
+		err = s.syncOnce()
+		var change *embeddingChange
+		if !errors.As(err, &change) {
+			return err
+		}
+		if err := s.idx.ResetEmbedding(s.fingerprint(), change.dimension); err != nil {
+			return err
+		}
+	}
+	return fmt.Errorf("kb: embedding dimensions changed repeatedly during rebuild")
+}
+
+func (s *Service) syncOnce() error {
 	seen := map[string]bool{}
 	disk, err := s.vaultFiles()
 	if err != nil {
@@ -275,25 +365,35 @@ func (s *Service) SyncFile(abs string) error {
 	if err != nil {
 		return err
 	}
+	s.syncMu.Lock()
 	if _, err := os.Stat(abs); os.IsNotExist(err) {
-		return s.idx.RemoveFile(rel)
+		err := s.idx.RemoveFile(rel)
+		s.syncMu.Unlock()
+		return err
 	}
-	return s.syncFile(abs, rel)
+	err = s.syncFile(abs, rel)
+	var change *embeddingChange
+	if errors.As(err, &change) {
+		if err := s.idx.ResetEmbedding(s.fingerprint(), change.dimension); err != nil {
+			s.syncMu.Unlock()
+			return err
+		}
+		s.syncMu.Unlock()
+		return s.Sync()
+	}
+	s.syncMu.Unlock()
+	return err
 }
 
 // syncFile 在某个已存在文件的 sha1 变化时重新索引它。配置了
 // embedder 时，chunk 按每个文件一批转入嵌入向量。
 func (s *Service) syncFile(abs, rel string) error {
-	etag, err := etagOf(abs)
+	data, etag, err := readFileETag(abs)
 	if err != nil {
 		return err
 	}
 	need, err := s.idx.NeedsReindex(rel, etag.SHA1)
 	if err != nil || !need {
-		return err
-	}
-	data, err := os.ReadFile(abs)
-	if err != nil {
 		return err
 	}
 	doc, err := vault.Parse(data)
@@ -311,12 +411,25 @@ func (s *Service) syncFile(abs, rel string) error {
 			return fmt.Errorf("kb: embed %q: %w", rel, err)
 		}
 	}
-	return s.idx.ReindexFile(index.File{
-		Path:    rel,
-		SHA1:    etag.SHA1,
-		MTime:   etag.MTime,
-		Chunks:  doc.Chunks,
-		Links:   doc.Links,
-		Vectors: vectors,
-	})
+	dimension := 0
+	if len(vectors) > 0 {
+		dimension = len(vectors[0])
+		changed, err := s.idx.EmbeddingChanged(s.fingerprint(), dimension)
+		if err != nil {
+			return err
+		}
+		if changed {
+			return &embeddingChange{dimension: dimension}
+		}
+	}
+	if err := s.idx.ReindexFile(index.File{
+		Path: rel, SHA1: etag.SHA1, MTime: etag.MTime,
+		Chunks: doc.Chunks, Links: doc.Links, Vectors: vectors,
+	}); err != nil {
+		return err
+	}
+	if dimension == 0 {
+		return nil
+	}
+	return s.idx.SetEmbeddingFingerprint(s.fingerprint(), dimension)
 }

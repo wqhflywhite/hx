@@ -162,8 +162,9 @@ type Manager struct {
 	clock func() time.Time
 	idgen func() string
 
-	mu    sync.Mutex
-	projs map[string]*projection
+	mu     sync.Mutex
+	projs  map[string]*projection
+	states map[string]*sync.Mutex
 }
 
 // NewManager 创建以 dir 为根的 Manager；clock 为事件打时间戳，
@@ -172,7 +173,23 @@ func NewManager(dir string, clock func() time.Time, idgen func() string) (*Manag
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
-	return &Manager{dir: dir, clock: clock, idgen: idgen, projs: make(map[string]*projection)}, nil
+	return &Manager{
+		dir: dir, clock: clock, idgen: idgen,
+		projs: make(map[string]*projection), states: make(map[string]*sync.Mutex),
+	}, nil
+}
+
+// appendState 返回同一 Manager 内按会话共享的顺序锁。写盘、缓存
+// 更新与冷读都按 state → m.mu 的顺序加锁，避免多 Resume 句柄交错。
+func (m *Manager) appendState(id string) *sync.Mutex {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	state := m.states[id]
+	if state == nil {
+		state = &sync.Mutex{}
+		m.states[id] = state
+	}
+	return state
 }
 
 // validateID 校验会话 id：拒绝任何可能让路径逃逸出会话目录的
@@ -223,27 +240,28 @@ func (m *Manager) open(id string, flag int) (Store, error) {
 	if err != nil {
 		return nil, err
 	}
+	state := m.appendState(id)
+	state.Lock()
+	defer state.Unlock()
 	f, err := os.OpenFile(path, flag|os.O_RDWR, 0o644)
 	if err != nil {
 		return nil, fmt.Errorf("session: open %q: %w", id, err)
 	}
 	off, err := repairTail(f)
 	if err != nil {
-		f.Close()
+		_ = f.Close()
 		return nil, fmt.Errorf("session: open %q: %w", id, err)
 	}
 	if _, err := f.Seek(off, io.SeekStart); err != nil {
-		f.Close()
+		_ = f.Close()
 		return nil, fmt.Errorf("session: open %q: %w", id, err)
 	}
-	return &FileLog{m: m, id: id, f: f}, nil
+	return &FileLog{m: m, id: id, f: f, state: state}, nil
 }
 
-// Resume 实现 Opener。打开后先经 repairTail 修复崩溃残留的坏
-// 后缀，再把文件指针定位到写入位置。句柄不带 O_APPEND（Windows
-// 上 O_APPEND 句柄无法 Truncate），因此写入位置完全依赖文件指针：
-// 单句柄由 FileLog.mu 串行化；多句柄、多进程的顺序协议在 P1-5
-// 收口之前，会话目录假设单写者独占。
+// Resume 实现 Opener。打开和坏后缀修复与其他追加共用会话顺序锁。
+// 句柄不带 O_APPEND（Windows 上 O_APPEND 句柄无法 Truncate），因此
+// 每次 Append 都在锁内重新 Seek 到当前文件末尾。
 func (m *Manager) Resume(id string) (Store, error) {
 	return m.open(id, 0)
 }
@@ -300,19 +318,34 @@ func repairTail(f *os.File) (int64, error) {
 	return off, nil
 }
 
+func cloneEvent(ev Event) Event {
+	ev.Data = append(json.RawMessage(nil), ev.Data...)
+	return ev
+}
+
+func cloneEvents(events []Event) []Event {
+	out := make([]Event, len(events))
+	for i, ev := range events {
+		out[i] = cloneEvent(ev)
+	}
+	return out
+}
+
 // Events 读回一个会话的完整日志；若投影缓存已热，
 // 则直接从内存返回防御性拷贝，不再重读文件。
 func (m *Manager) Events(id string) ([]Event, error) {
-	m.mu.Lock()
-	if p, ok := m.projs[id]; ok {
-		events := append([]Event(nil), p.events...)
-		m.mu.Unlock()
-		return events, nil
-	}
-	m.mu.Unlock()
 	path, err := m.path(id)
 	if err != nil {
 		return nil, err
+	}
+	state := m.appendState(id)
+	state.Lock()
+	defer state.Unlock()
+	m.mu.Lock()
+	p, ok := m.projs[id]
+	m.mu.Unlock()
+	if ok {
+		return cloneEvents(p.events), nil
 	}
 	return readEvents(path)
 }
@@ -373,23 +406,28 @@ func readEvents(path string) ([]Event, error) {
 	}
 	defer f.Close()
 	var events []Event
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 64*1024), 16*1024*1024)
-	for scanner.Scan() {
-		line := scanner.Bytes()
-		if len(line) == 0 {
-			continue
+	r := bufio.NewReader(f)
+	for {
+		line, readErr := r.ReadBytes('\n')
+		if readErr != nil && readErr != io.EOF {
+			return events, readErr
 		}
-		var ev Event
-		if err := json.Unmarshal(line, &ev); err != nil {
-			// 崩溃中途写了一半的行及其之后一律不可信：在第一个
-			// 坏行处截断，返回之前的好事件，而不是让整个会话
-			// 报错。
+		bad := false
+		if len(bytes.TrimRight(line, "\r\n")) > 0 {
+			var ev Event
+			if err := json.Unmarshal(line, &ev); err != nil {
+				// 崩溃中途写了一半的行及其之后一律不可信：在第一个
+				// 坏行处截断，返回之前的好事件，而不是让整个会话报错。
+				bad = true
+			} else {
+				events = append(events, ev)
+			}
+		}
+		if bad || readErr == io.EOF {
 			break
 		}
-		events = append(events, ev)
 	}
-	return events, scanner.Err()
+	return events, nil
 }
 
 // FileLog 是一个会话的 Store：一个只追加的 JSONL 文件。
@@ -397,40 +435,50 @@ type FileLog struct {
 	m  *Manager
 	id string
 
-	mu sync.Mutex
-	f  *os.File
+	mu    sync.Mutex
+	state *sync.Mutex
+	f     *os.File
 }
 
 // ID 返回这份日志的会话 id。
 func (l *FileLog) ID() string { return l.id }
 
-// Append 实现 Store：先写盘并 fsync（断电也可恢复，而不是只到
-// 页缓存），再同步到投影缓存，最后广播。
-// noteAppend 在 l.mu 释放之后运行且只获取 Manager 锁，
-// 因此两把锁永远不会嵌套。
+// Append 实现 Store：在同会话顺序锁内定位末尾、写盘、fsync 并更新
+// 缓存，随后释放所有锁再广播。缓存事件与广播载荷使用不同拷贝，
+// 监听器无法借 RawMessage 改写尚未投影的内存日志。
 func (l *FileLog) Append(c *fiber.Context, ev Event) error {
 	l.mu.Lock()
 	if l.f == nil {
 		l.mu.Unlock()
 		return fmt.Errorf("session: log %q is closed", l.id)
 	}
+	ev = cloneEvent(ev)
 	ev.Time = l.m.clock()
 	raw, err := json.Marshal(ev)
 	if err != nil {
 		l.mu.Unlock()
 		return err
 	}
+	l.state.Lock()
+	if _, err := l.f.Seek(0, io.SeekEnd); err != nil {
+		l.state.Unlock()
+		l.mu.Unlock()
+		return err
+	}
 	if _, err := l.f.Write(append(raw, '\n')); err != nil {
+		l.state.Unlock()
 		l.mu.Unlock()
 		return err
 	}
 	if err := l.f.Sync(); err != nil {
+		l.state.Unlock()
 		l.mu.Unlock()
 		return err
 	}
-	l.mu.Unlock()
 	l.m.noteAppend(l.id, ev)
-	event.Emit[Event](c, "session/event", ev)
+	l.state.Unlock()
+	l.mu.Unlock()
+	event.Emit[Event](c, "session/event", cloneEvent(ev))
 	return nil
 }
 

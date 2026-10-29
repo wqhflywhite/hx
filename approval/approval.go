@@ -3,6 +3,7 @@ package approval
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -17,8 +18,8 @@ import (
 // Prompter 询问用户某次工具调用是否可以执行；CLI 从 stdin 读取，
 // TUI 通过 "prompter" 配置键替换为自己的实现。
 type Prompter interface {
-	// Confirm 报告 call 是否被批准执行。
-	Confirm(c *fiber.Context, call llm.ToolCall) (bool, error)
+	// Confirm 报告 call 是否被批准执行；ctx 取消时等待必须退出。
+	Confirm(ctx context.Context, c *fiber.Context, call llm.ToolCall) (bool, error)
 }
 
 // stdinPrompter 是 CLI 的 Prompter：每次工具调用询问一行 y/n。
@@ -33,7 +34,7 @@ func StdinPrompter(in io.Reader, out io.Writer) Prompter {
 }
 
 // Confirm 实现 Prompter。
-func (p *stdinPrompter) Confirm(_ *fiber.Context, call llm.ToolCall) (bool, error) {
+func (p *stdinPrompter) Confirm(_ context.Context, _ *fiber.Context, call llm.ToolCall) (bool, error) {
 	fmt.Fprintf(p.out, "\n[approval] run %s %s? [y/N] ", call.Name, call.Arguments)
 	line, err := p.in.ReadString('\n')
 	if err != nil && line == "" {
@@ -131,11 +132,11 @@ func (approvalPlugin) Apply(c *fiber.Context, cfg map[string]any) error {
 	pc := parent.Context()
 	return c.Effect(func(*fiber.Context) (fiber.Disposer, error) {
 		return event.OnWaterfall[llm.ToolCall, llm.ToolCall](pc, "tools/pre-execute",
-			func(c *fiber.Context, call llm.ToolCall, next event.Next[llm.ToolCall, llm.ToolCall]) (llm.ToolCall, error) {
+			func(ctx context.Context, c *fiber.Context, call llm.ToolCall, next event.Next[llm.ToolCall, llm.ToolCall]) (llm.ToolCall, error) {
 				if m.mode(call.Name) == "auto" {
-					return next(c, call)
+					return next(ctx, c, call)
 				}
-				ok, err := prompter.Confirm(c, call)
+				ok, err := prompter.Confirm(ctx, c, call)
 				if err != nil {
 					return call, fmt.Errorf("approval: %w", err)
 				}
@@ -144,7 +145,7 @@ func (approvalPlugin) Apply(c *fiber.Context, cfg map[string]any) error {
 					// 这个错误变成 tool/result 内容。
 					return call, fmt.Errorf("approval: %q denied by user", call.Name)
 				}
-				return next(c, call)
+				return next(ctx, c, call)
 			}), nil
 	})
 }

@@ -2,6 +2,7 @@
 package prompt
 
 import (
+	"context"
 	"fmt"
 	"sort"
 	"strings"
@@ -84,8 +85,8 @@ func (p *Prompt) Assemble(c *fiber.Context) (string, []llm.ToolSchema, error) {
 			parts = append(parts, text)
 		}
 	}
-	text, err := event.Waterfall[string, string](c, "prompt/assemble", strings.Join(parts, "\n\n"),
-		func(_ *fiber.Context, in string) (string, error) { return in, nil })
+	text, err := event.Waterfall[string, string](c, context.Background(), "prompt/assemble", strings.Join(parts, "\n\n"),
+		func(_ context.Context, _ *fiber.Context, in string) (string, error) { return in, nil })
 	if err != nil {
 		return "", nil, err
 	}
@@ -93,8 +94,10 @@ func (p *Prompt) Assemble(c *fiber.Context) (string, []llm.ToolSchema, error) {
 	if reg, ok := fiber.Get[ToolSchemer](c, "tools"); ok {
 		schemas = reg.Schemas()
 	}
-	schemas, err = event.Waterfall[[]llm.ToolSchema, []llm.ToolSchema](c, "prompt/tools", schemas,
-		func(_ *fiber.Context, in []llm.ToolSchema) ([]llm.ToolSchema, error) { return in, nil })
+	schemas, err = event.Waterfall[[]llm.ToolSchema, []llm.ToolSchema](c, context.Background(), "prompt/tools", schemas,
+		func(_ context.Context, _ *fiber.Context, in []llm.ToolSchema) ([]llm.ToolSchema, error) {
+			return in, nil
+		})
 	if err != nil {
 		return "", nil, err
 	}

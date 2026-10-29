@@ -2,6 +2,7 @@
 package subagent
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -55,7 +56,7 @@ type delegateArgs struct {
 }
 
 // Execute 实现 tools.Tool。
-func (d *Delegate) Execute(c *fiber.Context, args json.RawMessage) (any, error) {
+func (d *Delegate) Execute(ctx context.Context, c *fiber.Context, args json.RawMessage) (any, error) {
 	var a delegateArgs
 	if err := json.Unmarshal(args, &a); err != nil {
 		return nil, fmt.Errorf("delegate: bad arguments: %w", err)
@@ -103,6 +104,8 @@ func (d *Delegate) Execute(c *fiber.Context, args json.RawMessage) (any, error) 
 		// 即时解开，不再拖到超时；defer 的 Dispose 会取消子 agent
 		// 的 turn（一轮）并撤销其 fiber。
 		return nil, fmt.Errorf("delegate: subagent %s interrupted: caller fiber disposed%s", id, partialSuffix(d.sessions, id))
+	case <-ctx.Done():
+		return nil, fmt.Errorf("delegate: subagent %s interrupted: %w%s", id, ctx.Err(), partialSuffix(d.sessions, id))
 	case <-timer.C:
 		return nil, fmt.Errorf("delegate: subagent %s timed out after %s%s", id, d.timeout, partialSuffix(d.sessions, id))
 	}

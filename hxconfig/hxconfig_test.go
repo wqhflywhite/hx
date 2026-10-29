@@ -154,6 +154,9 @@ func TestReloadSwapsLayer(t *testing.T) {
 		t.Fatalf("initial mount: got %q", got)
 	}
 
+	probeState.Lock()
+	disposedBefore := len(probeState.disposed)
+	probeState.Unlock()
 	f2, err := hxconfig.Load(writeConfig(t, dir, configBody(dir, "v2")))
 	if err != nil {
 		t.Fatal(err)
@@ -162,9 +165,10 @@ func TestReloadSwapsLayer(t *testing.T) {
 		t.Fatal(err)
 	}
 	probeState.Lock()
-	defer probeState.Unlock()
-	if len(probeState.disposed) != 1 || probeState.disposed[0] != "v1" {
-		t.Fatalf("old layer disposers must run, disposed %v", probeState.disposed)
+	disposed := append([]string(nil), probeState.disposed[disposedBefore:]...)
+	probeState.Unlock()
+	if len(disposed) != 1 || disposed[0] != "v1" {
+		t.Fatalf("old layer disposers must run, disposed %v", disposed)
 	}
 	if got, _ := fiber.Get[string](stack.Layer(), "probe"); got != "v2" {
 		t.Fatalf("reloaded mount: got %q", got)
@@ -244,7 +248,9 @@ func mountStack(t *testing.T, path string) *hxconfig.Stack {
 	if err != nil {
 		t.Fatal(err)
 	}
-	stack, err := hxconfig.MountStack(fiber.New().Context(), f, nil)
+	root := fiber.New()
+	t.Cleanup(func() { _ = root.Dispose() })
+	stack, err := hxconfig.MountStack(root.Context(), f, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -19,7 +19,9 @@ const (
 	StateLoading State = iota
 	// StateActive 表示 fiber 已装配完成，正在接受副作用。
 	StateActive
-	// StateDisposed 表示 fiber 已被 dispose（撤销），拒绝新的副作用。
+	// StateDisposing 表示首个 Dispose 已开始，但清理尚未完成。
+	StateDisposing
+	// StateDisposed 表示 fiber 已 dispose 完成，拒绝新的副作用。
 	StateDisposed
 )
 
@@ -30,6 +32,8 @@ func (s State) String() string {
 		return "loading"
 	case StateActive:
 		return "active"
+	case StateDisposing:
+		return "disposing"
 	case StateDisposed:
 		return "disposed"
 	}
@@ -47,15 +51,18 @@ type entry struct {
 // Fiber 是副作用树中的一个节点：它持有服务、disposer 和子 fiber，
 // Dispose 会按逆序撤销它持有的一切。
 type Fiber struct {
-	parent    *Fiber
-	root      *Fiber
-	name      string
-	services  map[string]entry
-	revokes   map[string][]*revokeHook // 服务被移除时触发
-	disposers []Disposer
-	children  map[*Fiber]struct{}
-	state     State
-	done      chan struct{}
+	parent      *Fiber
+	root        *Fiber
+	name        string
+	services    map[string]entry
+	revokes     map[string][]*revokeHook // 服务被移除时触发
+	disposers   []Disposer
+	children    map[*Fiber]struct{}
+	state       State
+	done        chan struct{}
+	disposeDone chan struct{}
+	disposeErr  error
+	scope       *Fiber // 兄弟服务回退搜索的子树根
 
 	// mu 保护整棵树（一律经由 root 加锁）；gen 和 cond 实现
 	// 插件依赖等待所用的 provide 通知。
@@ -67,15 +74,17 @@ type Fiber struct {
 // New 创建一个处于 active 状态的根 fiber。
 func New() *Fiber {
 	f := &Fiber{
-		name:     "root",
-		services: map[string]entry{},
-		revokes:  map[string][]*revokeHook{},
-		children: map[*Fiber]struct{}{},
-		state:    StateActive,
-		done:     make(chan struct{}),
+		name:        "root",
+		services:    map[string]entry{},
+		revokes:     map[string][]*revokeHook{},
+		children:    map[*Fiber]struct{}{},
+		state:       StateActive,
+		done:        make(chan struct{}),
+		disposeDone: make(chan struct{}),
 	}
 	f.root = f
 	f.cond = sync.NewCond(&f.mu)
+	f.scope = f
 	return f
 }
 
@@ -84,19 +93,43 @@ func New() *Fiber {
 func (f *Fiber) New(name string) (*Fiber, error) {
 	f.root.mu.Lock()
 	defer f.root.mu.Unlock()
-	if f.state == StateDisposed {
+	if f.state >= StateDisposing {
 		return nil, ErrDisposed
 	}
 	child := &Fiber{
-		parent:   f,
-		root:     f.root,
-		name:     name,
-		services: map[string]entry{},
-		revokes:  map[string][]*revokeHook{},
-		children: map[*Fiber]struct{}{},
-		state:    StateLoading,
-		done:     make(chan struct{}),
+		parent:      f,
+		root:        f.root,
+		name:        name,
+		services:    map[string]entry{},
+		revokes:     map[string][]*revokeHook{},
+		children:    map[*Fiber]struct{}{},
+		state:       StateLoading,
+		done:        make(chan struct{}),
+		disposeDone: make(chan struct{}),
+		scope:       f.scope,
 	}
+	f.children[child] = struct{}{}
+	return child, nil
+}
+
+func (f *Fiber) NewGeneration(name string) (*Fiber, error) {
+	f.root.mu.Lock()
+	defer f.root.mu.Unlock()
+	if f.state >= StateDisposing {
+		return nil, ErrDisposed
+	}
+	child := &Fiber{
+		parent:      f,
+		root:        f.root,
+		name:        name,
+		services:    map[string]entry{},
+		revokes:     map[string][]*revokeHook{},
+		children:    map[*Fiber]struct{}{},
+		state:       StateLoading,
+		done:        make(chan struct{}),
+		disposeDone: make(chan struct{}),
+	}
+	child.scope = child
 	f.children[child] = struct{}{}
 	return child, nil
 }
@@ -143,22 +176,32 @@ func (f *Fiber) Generation() uint64 {
 func (f *Fiber) WaitGeneration(gen uint64) bool {
 	f.root.mu.Lock()
 	defer f.root.mu.Unlock()
-	for f.state != StateDisposed && f.root.gen == gen {
+	for f.state < StateDisposing && f.root.gen == gen {
 		f.root.cond.Wait()
 	}
-	return f.state != StateDisposed
+	return f.state < StateDisposing
 }
 
 // Dispose 撤销 fiber 持有的一切：先子 fiber（与构建顺序相反），
-// 再按 LIFO 顺序执行自身的 disposer。它是幂等的，并聚合所有
-// disposer 的错误。
+// 再按 LIFO 顺序执行自身的 disposer。并发调用者等待首个清理完成，
+// 并获得同一份聚合错误；完成后的重复调用也返回该结果。
 func (f *Fiber) Dispose() error {
 	f.root.mu.Lock()
 	if f.state == StateDisposed {
+		err := f.disposeErr
 		f.root.mu.Unlock()
-		return nil
+		return err
 	}
-	f.state = StateDisposed
+	if f.state == StateDisposing {
+		done := f.disposeDone
+		f.root.mu.Unlock()
+		<-done
+		f.root.mu.Lock()
+		err := f.disposeErr
+		f.root.mu.Unlock()
+		return err
+	}
+	f.state = StateDisposing
 	close(f.done)
 	if f.parent != nil {
 		delete(f.parent.children, f)
@@ -194,9 +237,13 @@ func (f *Fiber) Dispose() error {
 		}
 	}
 	f.root.mu.Lock()
+	f.disposeErr = errors.Join(errs...)
+	f.state = StateDisposed
+	close(f.disposeDone)
 	f.root.cond.Broadcast()
+	err := f.disposeErr
 	f.root.mu.Unlock()
-	return errors.Join(errs...)
+	return err
 }
 
 // Context 是指向 fiber 的轻量句柄，到处传递。
@@ -214,7 +261,7 @@ func (c *Context) Fiber() *Fiber { return c.fiber }
 func (c *Context) Effect(fn func(*Context) (Disposer, error)) error {
 	f := c.fiber
 	f.root.mu.Lock()
-	if f.state == StateDisposed {
+	if f.state >= StateDisposing {
 		f.root.mu.Unlock()
 		return ErrDisposed
 	}
@@ -230,7 +277,7 @@ func (c *Context) Effect(fn func(*Context) (Disposer, error)) error {
 
 	f.root.mu.Lock()
 	defer f.root.mu.Unlock()
-	if f.state == StateDisposed {
+	if f.state >= StateDisposing {
 		f.root.mu.Unlock()
 		derr := d()
 		f.root.mu.Lock()
@@ -247,7 +294,7 @@ func (c *Context) Effect(fn func(*Context) (Disposer, error)) error {
 func Provide[T any](c *Context, name string, svc T) Disposer {
 	f := c.fiber
 	f.root.mu.Lock()
-	if f.state == StateDisposed {
+	if f.state >= StateDisposing {
 		f.root.mu.Unlock()
 		panic(fmt.Errorf("fiber: provide %q on disposed fiber %q", name, f.name))
 	}
@@ -277,26 +324,53 @@ func Provide[T any](c *Context, name string, svc T) Disposer {
 	}
 }
 
-// lookup 沿 fiber 链向上查找服务，找不到则回退到全树深度优先
-// 搜索，使挂载插件（子 fiber）提供的服务能从其祖先和兄弟解析
-// 到。祖先链命中永远优先于全树命中，保留「子遮蔽父」
-// 语义。
+// lookup 沿 fiber 链向上查找服务，找不到则回退到 scope 子树。
+// 普通 fiber 的 scope 是树根，保持既有全树搜索；generation 的
+// 子孙只搜索本代，再搜索外层 generation 的非 generation 部分，
+// 使新 layer 能解析 pinned 插件提供的服务，却看不到旧 layer。
 func (f *Fiber) lookup(name string) (entry, *Fiber, bool) {
 	for cur := f; cur != nil; cur = cur.parent {
 		if e, ok := cur.services[name]; ok {
 			return e, cur, true
 		}
 	}
-	return f.root.lookupDown(name)
+	if e, owner, ok := f.scope.lookupDown(name); ok {
+		return e, owner, true
+	}
+	for cur := f.parent; cur != nil; cur = cur.parent {
+		if cur.scope == cur {
+			if e, owner, ok := cur.lookupDownLocal(name); ok {
+				return e, owner, true
+			}
+		}
+	}
+	return entry{}, nil, false
 }
 
-// lookupDown 在 f 的子树中查找 name，先查自身服务。
+// lookupDown 在 f 的完整子树中查找 name，先查自身服务。
 func (f *Fiber) lookupDown(name string) (entry, *Fiber, bool) {
 	if e, ok := f.services[name]; ok {
 		return e, f, true
 	}
 	for child := range f.children {
 		if e, owner, ok := child.lookupDown(name); ok {
+			return e, owner, true
+		}
+	}
+	return entry{}, nil, false
+}
+
+// lookupDownLocal 查找 generation 的 pinned 区域，遇到嵌套
+// generation 即停止，避免把旧 layer 的服务暴露给新 layer。
+func (f *Fiber) lookupDownLocal(name string) (entry, *Fiber, bool) {
+	if e, ok := f.services[name]; ok {
+		return e, f, true
+	}
+	for child := range f.children {
+		if child.scope == child {
+			continue
+		}
+		if e, owner, ok := child.lookupDownLocal(name); ok {
 			return e, owner, true
 		}
 	}

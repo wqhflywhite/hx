@@ -122,6 +122,50 @@ func TestOnRevokedAbsentFiresImmediately(t *testing.T) {
 	_ = root.Dispose()
 }
 
+// TestGenerationLookupScope 覆盖 Reload 所需的服务边界：新代可见
+// pinned 祖先与自己的兄弟服务，但不能解析旧代 sibling 的服务。
+func TestGenerationLookupScope(t *testing.T) {
+	root := fiber.New()
+	defer root.Dispose()
+	base, err := root.NewGeneration("base")
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldLayer, err := base.NewGeneration("old")
+	if err != nil {
+		t.Fatal(err)
+	}
+	newLayer, err := base.NewGeneration("new")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 真实插件把服务提供在 generation 的子节点，而不是 generation 根本身。
+	basePlugin, err := base.New("base-plugin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fiber.Provide[string](basePlugin.Context(), "pinned", "base")
+	fiber.Provide[string](oldLayer.Context(), "old-only", "stale")
+	fiber.Provide[string](newLayer.Context(), "local", "fresh")
+	consumer, err := newLayer.New("consumer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := fiber.Get[string](consumer.Context(), "pinned"); !ok || got != "base" {
+		t.Fatalf("pinned = %q, %v; want base, true", got, ok)
+	}
+	if got, ok := fiber.Get[string](consumer.Context(), "local"); !ok || got != "fresh" {
+		t.Fatalf("local = %q, %v; want fresh, true", got, ok)
+	}
+	if got, ok := fiber.Get[string](consumer.Context(), "old-only"); ok {
+		t.Fatalf("new generation resolved stale sibling service %q", got)
+	}
+	// 普通 root 的全树回退不变，证明 old-only 确实已注册。
+	if got, ok := fiber.Get[string](root.Context(), "old-only"); !ok || got != "stale" {
+		t.Fatalf("root lookup = %q, %v; want stale, true", got, ok)
+	}
+}
+
 func TestWaitGeneration(t *testing.T) {
 	root := fiber.New()
 	ctx := root.Context()

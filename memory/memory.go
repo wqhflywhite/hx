@@ -11,6 +11,7 @@ import (
 	"crypto/sha1"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -81,7 +82,13 @@ type source struct {
 // readSource 加载一个记忆文件；文件不存在、不可读
 // 或仅含空白时视为确认缺席。
 func readSource(path string) (source, bool) {
-	data, err := os.ReadFile(path)
+	const maxSourceBytes = 1 << 20
+	f, err := os.Open(path)
+	if err != nil {
+		return source{}, false
+	}
+	defer f.Close()
+	data, err := io.ReadAll(io.LimitReader(f, maxSourceBytes))
 	if err != nil {
 		return source{}, false
 	}
@@ -138,7 +145,7 @@ func memoryBudgetMarker(specific source, omitted []source, included, maxBytes in
 }
 
 // fitSpecificSource 省略宽泛来源，并二分寻找最具体来源的最大可
-// 保留前缀；预算连空内容都放不下时退化为直接截断框架。
+// 保留前缀；极小预算只截断标注，始终保留完整开闭框架。
 func fitSpecificSource(specific source, omitted []source, maxBytes int) string {
 	best := ""
 	lo, hi := 0, len(specific.content)
@@ -157,7 +164,9 @@ func fitSpecificSource(specific source, omitted []source, maxBytes int) string {
 	if best != "" {
 		return best
 	}
-	return truncateUTF8(memoryFrame(memoryBudgetMarker(specific, omitted, 0, maxBytes), nil), maxBytes)
+	marker := memoryBudgetMarker(specific, omitted, 0, maxBytes)
+	available := maxBytes - len(frameOpen) - len(frameClose) - 2
+	return frameOpen + "\n" + truncateUTF8(marker, available) + "\n" + frameClose
 }
 
 // injectState 是每个会话记录最近一次注入的状态。
@@ -306,6 +315,9 @@ func (memoryPlugin) Apply(c *fiber.Context, cfg map[string]any) error {
 	maxBytes, err := configInt(cfg, "max_bytes", defaultMaxBytes)
 	if err != nil {
 		return err
+	}
+	if minFrame := len(frameOpen) + len(frameClose) + 2; maxBytes < minFrame {
+		return fmt.Errorf("memory: max_bytes must be at least %d to preserve the reminder frame, got %d", minFrame, maxBytes)
 	}
 	userPath, err := resolve(userFile)
 	if err != nil {

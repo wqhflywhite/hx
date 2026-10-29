@@ -1,6 +1,7 @@
 package toolgate_test
 
 import (
+	"context"
 	"encoding/json"
 	"runtime"
 	"strings"
@@ -26,7 +27,9 @@ func (t fakeTool) Name() string { return t.name }
 func (t fakeTool) Schema() map[string]any {
 	return map[string]any{"description": t.desc, "type": "object"}
 }
-func (fakeTool) Execute(_ *fiber.Context, _ json.RawMessage) (any, error) { return "ok", nil }
+func (fakeTool) Execute(_ context.Context, _ *fiber.Context, _ json.RawMessage) (any, error) {
+	return "ok", nil
+}
 
 // wire 搭一棵 root → tools/prompt/plugin:toolgate 的 fiber 树，
 // 返回 root 上下文、toolgate 的 fiber（供 Dispose）与两个服务。
@@ -149,7 +152,7 @@ func TestActivationFlow(t *testing.T) {
 		t.Fatalf("before search: schemas = %v; want beta filtered out", got)
 	}
 
-	res := reg.Execute(s1ctx, llm.ToolCall{Name: "tool_search", Arguments: `{"query":"beta"}`})
+	res := reg.Execute(context.Background(), s1ctx, llm.ToolCall{Name: "tool_search", Arguments: `{"query":"beta"}`})
 	if res.Error != "" {
 		t.Fatalf("tool_search error: %s", res.Error)
 	}
@@ -200,10 +203,10 @@ func TestWaterfallChainNext(t *testing.T) {
 	called := false
 	var seen []string
 	defer event.OnWaterfall[[]llm.ToolSchema, []llm.ToolSchema](ctx, "prompt/tools",
-		func(c *fiber.Context, in []llm.ToolSchema, next event.Next[[]llm.ToolSchema, []llm.ToolSchema]) ([]llm.ToolSchema, error) {
+		func(ctx context.Context, c *fiber.Context, in []llm.ToolSchema, next event.Next[[]llm.ToolSchema, []llm.ToolSchema]) ([]llm.ToolSchema, error) {
 			called = true
 			seen = schemaNames(in)
-			return next(c, in)
+			return next(ctx, c, in)
 		})()
 
 	if got := assembleNames(t, p, ctx); !equalNames(got, "alpha", "tool_search") {
