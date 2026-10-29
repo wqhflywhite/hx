@@ -50,8 +50,11 @@ go test -race -count=1 ./...
 Linux 测试机固定为 `192.168.1.4`，SSH 使用本机已配置的 `flywhitelaptop` 别名与对应密钥。Windows 本机只运行上述快速检查，不执行 Docker 或伪造 race 结果；通过 SSH 在 Linux 临时目录检出待验收提交，并在 Linux Docker 中执行：
 
 ```sh
-docker run --rm -v "$PWD":/src -w /src golang:1.27-bookworm \
-  sh -c "go build ./... && go vet ./... && go test -race -count=1 ./..."
+docker run --rm \
+  -e GOPROXY=https://goproxy.cn,https://mirrors.aliyun.com/goproxy/,direct \
+  -v "$HOME/.cache/go-mod:/go/pkg/mod" \
+  -v "$PWD":/src -w /src golang:1.27-bookworm \
+  sh -c "git config --global --add safe.directory /src && go mod download && go build ./... && go vet ./... && go test -race -count=1 ./..."
 ```
 
 改变发布行为后，还需：
